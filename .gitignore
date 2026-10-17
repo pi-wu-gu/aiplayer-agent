@@ -17,3 +17,4 @@ Thumbs.db
 # ===== 实例配置与本机路径（转公开清洗 2026-10-17）=====
 config/config.yaml
 aitest/_localpaths.py
+agent_bundle.zip
