@@ -199,6 +199,15 @@ UI_HTML = """<!DOCTYPE html>
     <div id="btns" style="margin-top:12px">
       <button id="wake">立即唤醒</button>
       <button id="stop" class="danger">强制停止</button>
+      <div style="margin-top:10px;border-top:1px solid #333;padding-top:8px">
+        <label style="font-size:12px;color:#9ab">控制台发话/指令（v0.2.1.28）</label>
+        <input id="ctext" type="text" placeholder="输入内容后选下方按钮" style="width:95%;margin:4px 0">
+        <div>
+          <button id="saybtn">📣 游戏内发话</button>
+          <button id="instrbtn">🎯 发指令给 agent</button>
+        </div>
+        <div id="cmsg" style="font-size:12px;color:#7c7;margin-top:3px"></div>
+      </div>
     </div>
     <h2 style="margin-top:16px">积压未读</h2>
     <div id="blist"></div>
@@ -332,6 +341,25 @@ $('save').onclick = function(){
 };
 
 $('wake').onclick = function(){
+  function csend(mode){
+    var t = document.getElementById('ctext').value.trim();
+    if (!t) return;
+    fetch('/' + mode, {method:'POST', headers:{'Content-Type':'application/json'},
+                       body: JSON.stringify({text: t})})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        document.getElementById('cmsg').textContent =
+          d.ok ? (mode === 'say' ? '已发话：' + d.said : '指令已入队，下次唤醒下达') 
+               : ('失败：' + (d.error || '未知'));
+        if (d.ok) document.getElementById('ctext').value = '';
+      })
+      .catch(function(e){ document.getElementById('cmsg').textContent = '请求失败'; });
+  }
+  document.getElementById('saybtn').onclick = function(){ csend('say'); };
+  document.getElementById('instrbtn').onclick = function(){ csend('instruct'); };
+  document.getElementById('ctext').addEventListener('keydown', function(e){
+    if (e.key === 'Enter') csend('instruct');
+  });
   fetch('/wake', {method:'POST'}).then(function(r){return r.json();})
     .then(function(d){ alert(d.msg); refresh(); });
 };
@@ -576,6 +604,25 @@ class _ControlHandler(BaseHTTPRequestHandler):
             changed = self.daemon._apply_overrides(data)
             self._json(200, {"ok": True, "changed": changed,
                              "config": self.daemon.config_get()})
+        elif path == "/say":
+            # 控制台发话（v0.2.1.28）：text → bot 游戏内 say（服务器所有人可见）
+            text = str(data.get("text") or "").strip()
+            if not text:
+                return self._json(400, {"ok": False, "error": "缺少 text"})
+            self.daemon._say(text)
+            self.daemon.log("控制台发话: %s" % text[:80])
+            self._json(200, {"ok": True, "said": text[:100]})
+        elif path == "/instruct":
+            # 控制台指令（v0.2.1.28）：text → 注入为操作者指示，随下次唤醒下达给 agent
+            text = str(data.get("text") or "").strip()
+            if not text:
+                return self._json(400, {"ok": False, "error": "缺少 text"})
+            with self.daemon.lock:
+                self.daemon.console_instructions.append(text)
+            self.daemon.log("控制台指令入队: %s" % text[:80])
+            self.daemon.wake_now.set()   # 未运行时立即唤醒处理；运行中则随下轮
+            self._json(200, {"ok": True, "queued": True,
+                             "msg": "指令已入队，将随下次唤醒下达给 agent"})
         else:
             self._json(404, {"error": "unknown path"})
 
@@ -587,6 +634,7 @@ class Daemon:
         self.cfg = cfg
         self.verbose = verbose
         dcfg = cfg.get("daemon") or {}
+        self.console_instructions = []   # 8770 控制台下发的操作者指令（v0.2.1.28）
         self.bot_names = list(dcfg.get("bot_names") or ["ExampleBot"])
         self.extra_mentions = list(dcfg.get("mention_extra") or [])
         self.poll_interval = float(dcfg.get("poll_interval", 2.0))
@@ -776,7 +824,7 @@ class Daemon:
             self.log("定时唤醒到点，但 agent 运行中 → 跳过（门控）")
             return
         with self.lock:
-            has_backlog = bool(self.backlog)
+            has_backlog = bool(self.backlog) or bool(self.console_instructions)
             n = len(self.backlog)
         if not has_backlog and self.wake_check_backlog:
             self.log("定时唤醒：无积压未读，无需运行")
@@ -803,6 +851,10 @@ class Daemon:
     def _build_task(self, reason, snapshot):
         mentions = [e for e in snapshot if e.get("mention")]
         lines = []
+        with self.lock:
+            pending, self.console_instructions = list(self.console_instructions), []
+        for t in pending:
+            lines.append("【控制台指令】%s（操作者经 8770 控制台下达，视为操作者直接指示，优先执行并汇报）" % t)
         if reason == "mention" and mentions:
             lines.append("【游戏内@提及】%s" % mentions[-1].get("text", ""))
             lines.append("（唤醒原因：游戏内有人提到你，本次由持续运行守护进程自动启动）")

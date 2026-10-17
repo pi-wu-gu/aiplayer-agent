@@ -485,3 +485,72 @@ class TestWorkerStateReset(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestConsoleSpeakInstruct(unittest.TestCase):
+    """8770 控制台发话/指令（v0.2.1.28）：
+    1. /instruct 入队 → _scheduled_wake 触发（有指令时无视 backlog 空判断）
+    2. _build_task 消费指令（视为操作者直接指示）并清空队列
+    3. /say 经 _say 下发到桥接（payload 校验）
+    4. UI 含 ctext/saybtn/instrbtn 三控件
+    """
+
+    def _daemon(self):
+        import threading
+        d = Daemon.__new__(Daemon)
+        d.cfg = {}
+        d.overrides = {}
+        d.backlog = []
+        d.console_instructions = []
+        d.wake_check_backlog = True
+        d.running = False
+        d.stats = {}
+        d.log = lambda msg: None
+        d.lock = threading.RLock()
+        d.wake_now = threading.Event()
+        d.wake_now.clear()
+        d.control_port = 8770
+        d.base = "http://127.0.0.1:8780"
+        return d
+
+    def test_instruct_triggers_scheduled_wake(self):
+        d = self._daemon()
+        d.console_instructions.append("指令A")
+        calls = []
+        d._trigger = lambda reason: calls.append(reason)
+        d._scheduled_wake()
+        self.assertEqual(calls, ["scheduled"])
+
+    def test_empty_no_wake(self):
+        d = self._daemon()
+        calls = []
+        d._trigger = lambda reason: calls.append(reason)
+        d._scheduled_wake()
+        self.assertEqual(calls, [])
+
+    def test_build_task_consumes_instructions(self):
+        d = self._daemon()
+        with d.lock:
+            d.console_instructions.append("去砍十块木头")
+            d.console_instructions.append("然后造工作台")
+        task = d._build_task("manual", [])
+        self.assertIn("【控制台指令】去砍十块木头", task)
+        self.assertIn("【控制台指令】然后造工作台", task)
+        self.assertIn("操作者直接指示", task)
+        self.assertEqual(d.console_instructions, [])   # 已消费清空
+
+    def test_say_posts_to_bridge(self):
+        from unittest.mock import patch
+        d = self._daemon()
+        with patch("core.daemon.requests.post") as mp:
+            d._say("大家好")
+        args, kwargs = mp.call_args
+        self.assertTrue(args[0].endswith("/command"))
+        cmd = kwargs["json"]["commands"][0]
+        self.assertEqual(cmd["type"], "say")
+        self.assertEqual(cmd["text"], "大家好")
+
+    def test_ui_has_console_widgets(self):
+        from core.daemon import UI_HTML
+        for token in ['id="ctext"', 'id="saybtn"', 'id="instrbtn"', "控制台发话/指令"]:
+            self.assertIn(token, UI_HTML)
