@@ -7,13 +7,25 @@
 - 《docs/可行性分析与查漏补缺.md》—— 五项需求逐项可行性 + 15 条查漏清单
 - 《../AI/docs/操作注意事项.md》—— MC 桥接协议与红线（agent 层对接依据）
 
-## 快速开始（规划中，随阶段更新）
+## 快速开始
+
+**前置**：Python **3.13+**（vendor/ 里的预编译 wheel 为 Windows cp313 版；Linux/macOS 需自行安装同名依赖）。
+**定位**：本 agent 默认驱动 [aiplayer 模组](https://github.com/pi-wu-gu/aiplayer) 的 `127.0.0.1:8780` 控制面——独立跑源码时需要 MC 客户端（装了模组）在运行。
+
 ```
-1. cp config/keys.yaml.example config/keys.yaml  # 手动填 key
-2. python run.py --check                         # 校验连通性/余量/模型列表
-3. python run.py --role primary --task "..."     # 启动主 agent（单次）
-4. python run.py --daemon                        # 持续运行模式（见下）
+1. 安装依赖（离线 wheel 已附在 vendor/wheels，免外网）：
+   pip install --no-index --find-links vendor/wheels requests pyyaml
+2. cp config/keys.yaml.example config/keys.yaml    # 手动填真实 api_key（此文件永不提交）
+3. 按需修改 config/config.yaml                      # 仓库内为参考实例配置，含本机路径示例
+4. python run.py --check                           # 校验连通性/余量/模型列表
+5. python run.py --offline                         # 离线一次性提示（不依赖 MC）
+   python run.py --role primary --task "..."       # 主 agent 单次任务
+   python run.py --daemon                          # 持续运行模式（见下）
 ```
+
+**打包部署**：`python scripts/build_agent_bundle.py` 把本框架打成 `agent_bundle.zip`
+（随模组 jar 分发，模组侧自动解压运行；内嵌运行时仅 Windows）。
+Windows 快捷方式：`scripts/启动agent.bat` / `scripts/停止agent.bat`。
 
 ## 权限表（config.yaml `permissions:` 节）
 
