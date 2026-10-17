@@ -415,9 +415,29 @@ class Reviewer:
         # R2 最近 6 次操作全部失败
         if len(recent) >= 6 and all(not r["ok"] for r in recent[-6:]):
             reasons.append("连续6次操作均失败")
-        # R3 生命值红线（直查桥接，不花 token）
+        # R3 生命值避险（直查桥接，不花 token）
+        #   ★语义变更（2026-10-17 用户指令）：血量问题**一律不硬停**——注入避险指令让
+        #   agent 自行决定解决方法（进食回血/脱离危险/反击/躲避），分两档紧急度：
+        #   <10 常规提醒；<5 危急强指令（但也不停止）。运行结束仍由轮数/其他规则管理。
         if hp is not None and hp < 10:
-            reasons.append("生命值 %s < 10，触发避险红线" % hp)
+            if hp < 5:
+                steer = ("【危急避险指令】生命值 %s < 5，濒死！立即执行自救且自救优先于一切任务："
+                         "①立刻吃食物（手持食物按住 key.use 约 2s）；②立刻远离一切怪物与危险"
+                         "（跑向高处/安全区）；③无食物就先脱离危险再想办法。"
+                         "完成自救并回血后才能继续原任务。" % hp)
+            else:
+                steer = ("【系统避险指令】当前生命值 %s < 10（安全阈值）。请立即自行解决，方案自选："
+                         "①吃食物回血（确认食物在快捷栏并手持，按住 key.use 约 2s 完成进食，"
+                         "进食后饱食度≥18 会自然回血）；②脱离危险（远离怪物/水/高处）；"
+                         "③有怪物贴身且手持武器时反击。"
+                         "解决后继续当前任务。下次审查若仍未解决会再次提醒。" % hp)
+            agent.messages.append({"role": "user", "content": steer})
+            used = (agent.total_tokens or 0) + (agent.sub_tokens or 0)
+            self.d.stats["review_steers"] = self.d.stats.get("review_steers", 0) + 1
+            self.d.log("审查(第%d轮): 注入避险指令（生命值 %s%s），交由 agent 自行解决，不停止"
+                       % (round_no, hp, "，危急档" if hp < 5 else ""))
+            self._record(round_no, "避险指令（health<10，非停止）", ["steer:health"], hp, used)
+            return None
         # R4 token 熔断
         budget = (self.cfg.get("cost_guard") or {}).get("session_token_budget")
         used = (agent.total_tokens or 0) + (agent.sub_tokens or 0)

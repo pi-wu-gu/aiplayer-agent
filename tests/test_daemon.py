@@ -171,13 +171,38 @@ class TestReviewerRules(unittest.TestCase):
         verdict = r.check(4, ag)
         self.assertIsNone(verdict)
 
-    def test_low_health_stops(self):
+    def test_low_health_steers_not_stops(self):
+        """★0.2.1.26b 语义：health<10 不再停止，注入避险指令并继续（用户指令：不硬停）。"""
         r = self._reviewer()
         r.d.query_health = lambda: 6
         ag = self._agent_with_results([("mc_state", "{}", True)])
         verdict = r.check(4, ag)
-        self.assertIsNotNone(verdict)
-        self.assertIn("避险红线", verdict)
+        self.assertIsNone(verdict)                       # 不停止
+        self.assertGreater(r.d.stats.get("review_steers", 0), 0)   # 计数注入
+        steer_msgs = [m for m in ag.messages if m["role"] == "user"
+                      and "避险指令" in m.get("content", "")]
+        self.assertEqual(len(steer_msgs), 1)             # 指令已注入
+        self.assertIn("自行解决", steer_msgs[0]["content"])
+
+    def test_critical_health_still_no_stop_but_urgent(self):
+        """health<5 危急档：仍不硬停（用户指令），但指令为危急措辞。"""
+        r = self._reviewer()
+        r.d.query_health = lambda: 3
+        ag = self._agent_with_results([("mc_state", "{}", True)])
+        verdict = r.check(4, ag)
+        self.assertIsNone(verdict)
+        steer_msgs = [m for m in ag.messages if m["role"] == "user"
+                      and "危急避险指令" in m.get("content", "")]
+        self.assertEqual(len(steer_msgs), 1)
+
+    def test_healthy_no_steer(self):
+        """health≥10 无注入、无停止。"""
+        r = self._reviewer()
+        r.d.query_health = lambda: 12
+        ag = self._agent_with_results([("mc_state", "{}", True)])
+        verdict = r.check(4, ag)
+        self.assertIsNone(verdict)
+        self.assertEqual(r.d.stats.get("review_steers", 0), 0)
 
     def test_not_due_skips(self):
         r = self._reviewer(every=32)
