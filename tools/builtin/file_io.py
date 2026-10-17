@@ -7,7 +7,7 @@
       file_mode: full            # full | readonly | off
       roots:                     # 具名白名单根：文件操作只能落在其中之一
         agent: "."               # 相对路径基于 AGENT_ROOT
-        shared: "C:/Users/w0801/PCL2/AI/game/aiplayer"
+        shared: "D:/mc/game/aiplayer"       # 示例：模组侧运行数据目录（按本机游戏目录修改）
       default_root: agent        # 相对路径默认落在哪个根
 
 ★两道防线，缺一不可：

@@ -2,6 +2,7 @@
 """MC 桥接工具：mc_state（读状态）/ mc_act（发动作+等结果）。阶段2
 协议见 AI/docs/操作注意事项.md；控制面 = aiplayer 模组 127.0.0.1:8780（旧 JsMacros 桥 8765 已废弃）。"""
 import json
+import os
 import re
 import time
 
@@ -290,7 +291,11 @@ def _slot_zone_warning(cfg, slot):
 
 # ---------- 注册用包装（manifest + fn） ----------
 
-GUIDE_PATH = r"C:/Users/w0801/PCL2/AI/docs/操作注意事项.md"
+# 操作指南文档：环境变量 AGENT_GUIDE_PATH 可覆盖；默认按 PCL2 部署布局相对定位
+GUIDE_PATH = os.environ.get(
+    "AGENT_GUIDE_PATH",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))), "AI", "docs", "操作注意事项.md"))
 GUIDE_SECTIONS = {
     "槽位": "四大界面槽位映射",
     "工作流": "关键工作流 SOP",

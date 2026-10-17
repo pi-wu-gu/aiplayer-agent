@@ -27,8 +27,10 @@ SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # PCL2/agent
 VENDOR = os.path.join(SRC, "vendor")
 EMBED_ZIP = os.path.join(VENDOR, "python-embed.zip")
 WHEELS_DIR = os.path.join(VENDOR, "wheels")
-DEFAULT_OUT = (r"C:/Users/w0801/Documents/project/minecraft mod/aiplayer"
-               r"/src/main/resources/assets/aiplayer/agent_bundle.zip")
+# 输出路径：环境变量 AGENT_BUNDLE_OUT 可覆盖；默认写到仓库根 agent_bundle.zip
+DEFAULT_OUT = os.environ.get(
+    "AGENT_BUNDLE_OUT",
+    os.path.join(SRC, "agent_bundle.zip"))
 PREFIX = "agent/"
 RT = PREFIX + "runtime/python/"
 
@@ -54,9 +56,16 @@ def excluded(rel):
 def add_source(z):
     n = 0
     for f in INCLUDE_FILES:
-        if not os.path.exists(os.path.join(SRC, f)):
-            raise SystemExit("缺少必需文件: %s" % f)
-        z.write(os.path.join(SRC, f), PREFIX + f)
+        src_f = os.path.join(SRC, f)
+        if not os.path.exists(src_f):
+            # config/config.yaml 是实例配置（不入库）：仓库缺失时回退到模板 example，
+            # 打包后仍占位为 config/config.yaml（第三方拿到后填 keys/路径即可用）
+            if f == "config/config.yaml":
+                src_f = os.path.join(SRC, "config/config.yaml.example")
+                print("提示: 未找到实例配置 config/config.yaml，bundle 使用 config.yaml.example 模板")
+            else:
+                raise SystemExit("缺少必需文件: %s" % f)
+        z.write(src_f, PREFIX + f)
         n += 1
     for d in INCLUDE_DIRS:
         base = os.path.join(SRC, d)

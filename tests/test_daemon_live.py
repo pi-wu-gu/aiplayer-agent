@@ -39,7 +39,7 @@ def main():
     if os.path.exists(state_path):
         os.remove(state_path)
     cfg["daemon"] = {
-        "bot_names": ["muyiyangDeepseek"],
+        "bot_names": ["ExampleBot"],
         "poll_interval": 0.5,
         "wake_interval": 3600,          # 测试不依赖定时唤醒
         "review_every": 32,
@@ -79,9 +79,9 @@ def main():
 
     # ---- 喂一条@提及 + 一条普通消息（只喂一次，之后恢复真实轮询） ----
     fake_entries = [
-        {"id": 9001, "t": time.time(), "text": "[world] <muyiyang>: @muyiyangDeepseek 看看经验块"},
+        {"id": 9001, "t": time.time(), "text": "[world] <ExampleBot>: @ExampleBot 看看经验块"},
         {"id": 9002, "t": time.time(), "text": "[world] <Lyuan666>: 今天天气不错"},
-        {"id": 9003, "t": time.time(), "text": "[world] <muyiyangDeepseek>: [自动] 测试开始: 自己的发言"},
+        {"id": 9003, "t": time.time(), "text": "[world] <ExampleBot>: [自动] 测试开始: 自己的发言"},
     ]
     real_fetch = d._fetch_chat
     fed = {"done": False}

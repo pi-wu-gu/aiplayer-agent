@@ -27,7 +27,7 @@ def make_cfg():
     return {
         "defaults": {"provider": "deepseek", "model": "deepseek-flash"},
         "mc_bridge": {"base_url": "http://127.0.0.1:9999"},   # 测试不直连
-        "daemon": {"bot_names": ["muyiyangDeepseek"], "mention_extra": ["小深"],
+        "daemon": {"bot_names": ["ExampleBot"], "mention_extra": ["小深"],
                    "review_every": 4, "backlog_max": 5, "review_llm": False},
         "cost_guard": {"enabled": False},
     }
@@ -84,25 +84,25 @@ def patch_llm(agent):
 class TestMention(unittest.TestCase):
     def setUp(self):
         self.d = Daemon.__new__(Daemon)     # 不跑 __init__（避免连桥接/落盘）
-        self.d.bot_names = ["muyiyangDeepseek"]
+        self.d.bot_names = ["ExampleBot"]
         self.d.extra_mentions = ["小深"]
 
     def test_speaker_parse(self):
-        self.assertEqual(parse_speaker("[world] <muyiyang>: 你好"), "muyiyang")
+        self.assertEqual(parse_speaker("[world] <ExampleBot>: 你好"), "ExampleBot")
         self.assertEqual(parse_speaker("<Lyuan666> hi"), "Lyuan666")
         self.assertIsNone(parse_speaker("liyinyin取得了进度[精准对接]"))
 
     def test_other_mention_triggers(self):
-        self.assertTrue(self.d.is_mention("[world] <muyiyang>: @muyiyangDeepseek 看这个"))
-        self.assertTrue(self.d.is_mention("<Lyuan666> muyiyangDeepseek 过来"))
+        self.assertTrue(self.d.is_mention("[world] <Steve>: @ExampleBot 看这个"))
+        self.assertTrue(self.d.is_mention("<Lyuan666> ExampleBot 过来"))
         self.assertTrue(self.d.is_mention("<a> 小深 在吗"))
 
     def test_own_message_never_triggers(self):
-        self.assertFalse(self.d.is_mention("[world] <muyiyangDeepseek>: [自动] 测试开始"))
-        self.assertFalse(self.d.is_mention("<muyiyangDeepseek> 我自己说话"))
+        self.assertFalse(self.d.is_mention("[world] <ExampleBot>: [自动] 测试开始"))
+        self.assertFalse(self.d.is_mention("<ExampleBot> 我自己说话"))
 
     def test_plain_message_no_trigger(self):
-        self.assertFalse(self.d.is_mention("[world] <muyiyang>: 今天天气不错"))
+        self.assertFalse(self.d.is_mention("[world] <ExampleBot>: 今天天气不错"))
         self.assertFalse(self.d.is_mention(""))
 
 

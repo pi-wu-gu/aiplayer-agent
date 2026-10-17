@@ -11,7 +11,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from aitest.ctl import cmd  # noqa: E402
 
-TOML = Path("C:/Users/w0801/PCL2/AI/game/config/aiplayer-common.toml")
+try:/n    from aitest._localpaths import TOML          # 本机路径（不入库）
+except ImportError:                              # 未配置 _localpaths → 占位
+    TOML = Path("game/config/aiplayer-common.toml")
 KEY = "gameActionMode"
 
 

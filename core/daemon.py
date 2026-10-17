@@ -567,7 +567,7 @@ class Daemon:
         self.cfg = cfg
         self.verbose = verbose
         dcfg = cfg.get("daemon") or {}
-        self.bot_names = list(dcfg.get("bot_names") or ["muyiyangDeepseek"])
+        self.bot_names = list(dcfg.get("bot_names") or ["ExampleBot"])
         self.extra_mentions = list(dcfg.get("mention_extra") or [])
         self.poll_interval = float(dcfg.get("poll_interval", 2.0))
         self.wake_interval = float(dcfg.get("wake_interval", 300))

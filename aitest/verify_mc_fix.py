@@ -10,7 +10,9 @@ import json
 import sys
 import time
 
-SIDECAR = r"C:/Users/w0801/PCL2/AI/game/aiplayer-agent/0.2.1.12"
+try:/n    from aitest._localpaths import SIDECAR      # 本机路径（不入库）
+except ImportError:                              # 未配置 _localpaths → 占位
+    SIDECAR = r"aiplayer-agent/0.2.1.12"
 sys.path.insert(0, SIDECAR)
 
 import requests  # noqa: E402

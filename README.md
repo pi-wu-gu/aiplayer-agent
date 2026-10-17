@@ -68,7 +68,7 @@ python run.py --daemon
 
 | 机制 | 行为 |
 |---|---|
-| 聊天监听 | 每 `poll_interval` 秒轮询桥接 /chat；**他人**发言 @提及 bot（`muyiyangDeepseek` 或 `mention_extra` 词）→ 立即唤醒运行。bot 自身 say 不触发（防自激） |
+| 聊天监听 | 每 `poll_interval` 秒轮询桥接 /chat；**他人**发言 @提及 bot（`ExampleBot` 或 `mention_extra` 词）→ 立即唤醒运行。bot 自身 say 不触发（防自激） |
 | 定时唤醒 | 每 `wake_interval` 秒到点检查**积压未读**；有积压才触发运行，无积压只记录 |
 | 周期审查 | agent 每跑 `review_every`（默认32）轮，审查器唤醒一次：规则检查（同操作连续3次失败/连续6次失败/生命<10/token超预算）＋可选 LLM 审查（`review_llm`）。**审查有权强制停止思考**（轮边界生效，游戏内播报原因） |
 | 唤醒门控 | 所有唤醒仅在 agent **未运行**时生效：运行中提到→记入积压；定时/手动唤醒→跳过并计数 |

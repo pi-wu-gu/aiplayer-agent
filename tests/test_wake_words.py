@@ -16,7 +16,7 @@ from tools.builtin import wake_words  # noqa: E402
 
 
 def cfg_with(**daemon):
-    base = {"daemon": {"bot_names": ["muyiyangDeepseek"], "mention_extra": []}}
+    base = {"daemon": {"bot_names": ["ExampleBot"], "mention_extra": []}}
     base["daemon"].update(daemon)
     return base
 
@@ -91,7 +91,7 @@ class DaemonMatchTest(unittest.TestCase):
     def _daemon(self, tmp, allow):
         from core.daemon import Daemon
         d = Daemon.__new__(Daemon)
-        d.bot_names = ["muyiyangDeepseek"]
+        d.bot_names = ["ExampleBot"]
         d.extra_mentions = []
         d.allow_ai_wake_words = allow
         d.ai_wake_words = []
@@ -118,7 +118,7 @@ class DaemonMatchTest(unittest.TestCase):
         self.assertTrue(d.is_mention("来玩呀 小深"))
         self.assertFalse(d.is_mention("随便说点什么"))
         # 自己发言不触发（防自激）
-        self.assertFalse(d.is_mention("<muyiyangDeepseek> 小深"))
+        self.assertFalse(d.is_mention("<ExampleBot> 小深"))
 
     def test_ignored_when_disabled(self):
         d = self._daemon(self.tmp.name, allow=False)

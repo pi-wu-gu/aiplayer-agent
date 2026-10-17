@@ -14,7 +14,7 @@ from core.context import ResultCompressor  # noqa: E402
 from core import orchestrator  # noqa: E402
 from tools.builtin import mc_bridge  # noqa: E402
 
-PRIMARY_PROMPT = """你是 MC AI 玩家（muyiyangDeepseek）的决策层 agent。用 mc_state 读状态、mc_act 执行动作。用中文简短汇报。
+PRIMARY_PROMPT = """你是 MC AI 玩家（__BOT_NAME__）的决策层 agent。用 mc_state 读状态、mc_act 执行动作。用中文简短汇报。
 
 分工纪律（★默认照此执行）：你是主进程，**每轮只做短决策**——读状态、定下一步、执行、简短汇报；
   **长思考不要在主进程做**：需要长调研/长规划/大量推算时，用 spawn_subagent 交给子 agent 并等它返回，
@@ -261,7 +261,9 @@ def run_task(cfg, task, max_rounds=None, round_hook=None, stop_event=None,
     comp = ResultCompressor(threshold=cfg.get("context", {}).get("compress_threshold", 350))
     chat_buf = ChatBuffer(cfg)
     mem_block = _auto_memory_block(cfg)
-    agent = Agent("primary", PRIMARY_PROMPT + ("\n\n" + mem_block if mem_block else ""), reg, cfg,
+    _bot = ((cfg.get("daemon") or {}).get("bot_names") or ["ExampleBot"])[0]
+    primary_prompt = PRIMARY_PROMPT.replace("__BOT_NAME__", _bot)
+    agent = Agent("primary", primary_prompt + ("\n\n" + mem_block if mem_block else ""), reg, cfg,
                   max_rounds=max_rounds or 12, compressor=comp,
                   prune_keep=cfg.get("context", {}).get("prune_keep", 10),
                   log_path=os.path.join(config_loader.AGENT_ROOT, "logs",

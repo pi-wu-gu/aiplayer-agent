@@ -39,7 +39,7 @@ def main():
     if os.path.exists(state_path):
         os.remove(state_path)
     cfg["daemon"] = {
-        "bot_names": ["muyiyangDeepseek"],
+        "bot_names": ["ExampleBot"],
         "poll_interval": 2.0,
         "wake_interval": 3600,
         "review_every": 32,
@@ -101,14 +101,14 @@ def main():
     body = {"poll_interval": 0.8, "wake_interval": 120, "review_every": 16,
             "review_llm": True, "max_rounds_per_run": 40, "run_cooldown": 3,
             "backlog_max": 100, "wake_check_backlog": False,
-            "bot_names": ["muyiyangDeepseek", "小深"], "mention_extra": ["帮手"]}
+            "bot_names": ["ExampleBot", "小深"], "mention_extra": ["帮手"]}
     resp = requests.post(base + "/config", json=body, timeout=5).json()
     check("POST /config 成功", resp.get("ok") is True)
     check("changed含poll_interval", "poll_interval" in resp.get("changed", {}))
     check("热生效: daemon.poll_interval=0.8", d.poll_interval == 0.8)
     check("热生效: daemon.review_every=16", d.review_every == 16)
     check("热生效: review_llm=True", d.review_llm is True)
-    check("热生效: bot_names更新", d.bot_names == ["muyiyangDeepseek", "小深"])
+    check("热生效: bot_names更新", d.bot_names == ["ExampleBot", "小深"])
     check("热生效: mention_extra更新", d.extra_mentions == ["帮手"])
     check("热生效: max_rounds_per_run→max_rounds=40", d.max_rounds == 40)
     c2 = requests.get(base + "/config", timeout=5).json()["config"]
@@ -121,7 +121,7 @@ def main():
     check("参数已落盘", st.get("config", {}).get("poll_interval") == 0.8)
     d2 = daemon_mod.Daemon(cfg, verbose=False)     # 同 state_path → 恢复
     check("新实例恢复参数", d2.poll_interval == 0.8 and d2.review_every == 16
-          and d2.bot_names == ["muyiyangDeepseek", "小深"] and d2.max_rounds == 40)
+          and d2.bot_names == ["ExampleBot", "小深"] and d2.max_rounds == 40)
     check("新实例恢复mention_extra", d2.extra_mentions == ["帮手"])
 
     # 6) 唤醒/停止按钮走的还是老路由（回归）

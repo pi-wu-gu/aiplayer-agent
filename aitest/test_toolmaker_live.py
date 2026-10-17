@@ -14,8 +14,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from aitest.ctl import cmd  # noqa: E402
 
-TOML = Path("C:/Users/w0801/PCL2/AI/game/config/aiplayer-common.toml")
-TOOLS_DIR = Path("C:/Users/w0801/PCL2/AI/game/aiplayer/tools")
+try:/n    from aitest._localpaths import TOML, TOOLS_DIR  # 本机路径（不入库）
+except ImportError:                              # 未配置 _localpaths → 占位
+    TOML = Path("game/config/aiplayer-common.toml")
+    TOOLS_DIR = Path("game/aiplayer/tools")
 INDEX = TOOLS_DIR / "index.json"
 PASS, FAIL = [], []
 
