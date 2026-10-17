@@ -558,3 +558,62 @@ class TestConsoleSpeakInstruct(unittest.TestCase):
                            UI_HTML.index("$('stop')"))
         for token in ['id="ctext"', 'id="saybtn"', 'id="instrbtn"', 'agent 交流']:
             self.assertIn(token, UI_HTML)
+
+
+class TestRunDigestAndFinalize(unittest.TestCase):
+    """方案C 收尾（v0.2.1.30）：机械摘要 + 异常中断自述整理。"""
+
+    def _fake_agent(self):
+        class A:
+            rounds_used = 12
+            total_tokens = 34567
+            messages = []
+            round_hook = "哨兵钩子"
+            step_calls = []
+
+            def step(self, t):
+                self.step_calls.append(t)
+                return "收尾完成"
+        a = A()
+        a.recent_results = [
+            {"round": 10, "tool": "mc_act", "args": '{"type":"look"}', "ok": True,
+             "head": "look ok"},
+            {"round": 11, "tool": "mc_act", "args": '{"type":"move"}', "ok": False,
+             "head": "move blocked"},
+        ]
+        return a
+
+    def test_write_run_digest(self):
+        import os, tempfile
+        from core.runner import write_run_digest
+        a = self._fake_agent()
+        path = os.path.join(tempfile.gettempdir(), "digest_test.md")
+        write_run_digest(path, a, "清理背包", "token 用量超出预算")
+        with open(path, encoding="utf-8") as fh:
+            txt = fh.read()
+        os.remove(path)
+        self.assertIn("token 用量超出预算", txt)
+        self.assertIn("清理背包", txt)
+        self.assertIn("mc_act", txt)
+        self.assertIn("失败", txt)          # 第 11 步失败被如实记录
+
+    def test_finalize_appends_and_restores_hook(self):
+        from core.runner import _finalize_run
+        a = self._fake_agent()
+        _finalize_run(a, "token 用量超出预算")
+        self.assertEqual(len(a.step_calls), 1)              # 收尾轮跑了一次 step
+        self.assertIn("收尾整理", a.step_calls[0])
+        self.assertIn("token 用量超出预算", a.messages[-1]["content"])  # 注入的指令
+        self.assertEqual(a.round_hook, "哨兵钩子")           # ★钩子已还原
+
+    def test_build_task_includes_digest(self):
+        import os, tempfile
+        d = TestConsoleSpeakInstruct._daemon(self)
+        path = os.path.join(tempfile.gettempdir(), "digest_test2.md")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("- 终止原因: token 熔断\n- 下一步: 继续整理背包")
+        d.digest_path = path
+        task = d._build_task("scheduled", [])
+        os.remove(path)
+        self.assertIn("上次运行摘要", task)
+        self.assertIn("继续整理背包", task)

@@ -245,8 +245,42 @@ def _auto_memory_block(cfg, max_chars=4000):
             "（这里只有压缩档；更细的日档/raw 用 file_read 查 docs/记忆/，全部记忆均可访问）" % body)
 
 
+FINALIZE_PROMPT = ("【收尾整理】本次运行即将结束（原因：%s）。请做一次记忆整理并收尾："
+                   "用 file_write 把【本次完成的事/关键发现/当前坐标与状态/下一步建议】"
+                   "追加写入 shared 区的 docs/记忆/last_run_plan.md（一次调用完成），"
+                   "然后用一句话汇报。不要执行其他任何动作。")
+
+
+def write_run_digest(path, agent, task, stop_reason):
+    """机械运行摘要（方案C 兜底层，0 token）：每次运行结束覆盖写，供下次任务构建引用。"""
+    lines = ["# 上次运行摘要（机械记录，%s）" % time.strftime("%Y-%m-%d %H:%M:%S"),
+             "- 终止原因: %s" % (stop_reason or "正常收尾"),
+             "- 任务: %s" % (task or "")[:160],
+             "- 轮次: %s  主token: %s" % (getattr(agent, "rounds_used", 0),
+                                          getattr(agent, "total_tokens", 0)),
+             "- 最近动作:"]
+    for r in list(getattr(agent, "recent_results", []) or [])[-8:]:
+        lines.append("  - R%s %s %s | %s | %s" % (
+            r.get("round", "?"), r.get("tool", "?"), str(r.get("args", ""))[:70],
+            "成功" if r.get("ok") else "失败",
+            str(r.get("head", ""))[:70].replace(chr(10), " ")))
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(chr(10).join(lines) + chr(10))
+
+
+def _finalize_run(agent, reason):
+    """方案C 自述层：异常中断时注入收尾指令并让 agent 跑一小段（豁免审查钩子）。"""
+    agent.messages.append({"role": "user", "content": FINALIZE_PROMPT % reason})
+    saved = getattr(agent, "round_hook", None)
+    try:
+        agent.round_hook = None            # 收尾轮豁免审查（防 R1/R2/R4 递归掐死整理）
+        agent.step("【收尾整理】按上一条指令完成记忆整理并简短汇报")
+    finally:
+        agent.round_hook = saved
+
+
 def run_task(cfg, task, max_rounds=None, round_hook=None, stop_event=None,
-             verbose=True, trigger="manual"):
+             verbose=True, trigger="manual", stop_info=None):
     """跑一次主 agent 任务。返回 (final_text, stats_dict)。
     round_hook(round_no)：每轮结束调用，返回非空=强制停止（daemon 审查用）。
     stop_event：threading.Event，set 后轮边界立刻终止思考。
@@ -305,6 +339,19 @@ def run_task(cfg, task, max_rounds=None, round_hook=None, stop_event=None,
     except Exception:
         pass
     out = agent.step(task)
+    stop_reason = (stop_info or {}).get("reason")
+    # ★方案C 收尾（v0.2.1.30）：机械摘要每次必写（0 token 兜底）；异常中断再给
+    #   agent 自述整理机会（豁免审查钩子）——下轮任务构建引用摘要续作
+    try:
+        write_run_digest(os.path.join(config_loader.AGENT_ROOT, "logs", "last_run_digest.md"),
+                         agent, task, stop_reason)
+    except Exception:
+        pass
+    if stop_reason:
+        try:
+            _finalize_run(agent, stop_reason)
+        except Exception:
+            pass
     stats = _session_stats()
     agent.logger.log("task_end", rounds=agent.rounds_used, tokens=agent.total_tokens,
                      elapsed=round(time.time() - agent.created_at, 1), final_head=(out or "")[:200])

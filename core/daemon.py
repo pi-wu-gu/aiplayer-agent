@@ -862,6 +862,18 @@ class Daemon:
             lines.append("【定时唤醒】按计划检查积压未读消息，处理需要回应的事项")
         else:
             lines.append("【手动唤醒】操作者通过控制API(:%d /wake)手动唤醒" % self.control_port)
+        # 上次运行摘要（方案C 兜底层：机械记录，续作参考；0 token）
+        try:
+            digest_path = getattr(self, "digest_path", None) or os.path.join(
+                config_loader.AGENT_ROOT, "logs", "last_run_digest.md")
+            if os.path.exists(digest_path):
+                with open(digest_path, encoding="utf-8") as df:
+                    digest_txt = df.read()[:1200]
+                if digest_txt.strip():
+                    lines.append("【上次运行摘要（机械记录，续作参考）】")
+                    lines.append(digest_txt)
+        except Exception:
+            pass
         if snapshot:
             lines.append("积压未读共 %d 条，最近几条：" % len(snapshot))
             for e in snapshot[-10:]:
@@ -905,10 +917,17 @@ class Daemon:
             except requests.RequestException:
                 pass
             self.log("唤醒运行[%s] 开始: %s" % (reason, task[:70].replace("\n", " ")))
+            stop_info = {}
+
+            def _review_hook(rn, ag):
+                v = self.reviewer.check(rn, ag)
+                if v:
+                    stop_info["reason"] = v   # 供 run_task 收尾整理（方案C）
+                return v
             out, stats = run_task(self.cfg, task, max_rounds=self.max_rounds,
-                                  round_hook=self.reviewer.check,
+                                  round_hook=_review_hook,
                                   stop_event=self.stop_event, verbose=True,
-                                  trigger=reason)
+                                  trigger=reason, stop_info=stop_info)
             blocked = bool(stats.get("blocked"))
             if blocked:
                 # 护栏拦截未运行 → 积压原样放回（按 id 去重，保持顺序）
