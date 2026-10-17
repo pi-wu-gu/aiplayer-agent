@@ -191,6 +191,15 @@ UI_HTML = """<!DOCTYPE html>
       </span>
     </h2>
     <div id="feed"></div>
+    <div style="margin-top:10px;border-top:1px solid #444;padding-top:8px">
+      <label style="font-size:12px;color:#9ab">agent 交流 —— 游戏内发话 / 给 agent 发指令（v0.2.1.28）</label>
+      <input id="ctext" type="text" placeholder="输入内容后选下方按钮（回车=发指令）" style="width:95%;margin:4px 0">
+      <div>
+        <button id="saybtn">📣 游戏内发话</button>
+        <button id="instrbtn">🎯 发指令给 agent</button>
+      </div>
+      <div id="cmsg" style="font-size:12px;color:#7c7;margin-top:3px"></div>
+    </div>
   </div>
   <!-- 右列：状态与控制 -->
   <div class="card">
@@ -199,15 +208,6 @@ UI_HTML = """<!DOCTYPE html>
     <div id="btns" style="margin-top:12px">
       <button id="wake">立即唤醒</button>
       <button id="stop" class="danger">强制停止</button>
-      <div style="margin-top:10px;border-top:1px solid #333;padding-top:8px">
-        <label style="font-size:12px;color:#9ab">控制台发话/指令（v0.2.1.28）</label>
-        <input id="ctext" type="text" placeholder="输入内容后选下方按钮" style="width:95%;margin:4px 0">
-        <div>
-          <button id="saybtn">📣 游戏内发话</button>
-          <button id="instrbtn">🎯 发指令给 agent</button>
-        </div>
-        <div id="cmsg" style="font-size:12px;color:#7c7;margin-top:3px"></div>
-      </div>
     </div>
     <h2 style="margin-top:16px">积压未读</h2>
     <div id="blist"></div>
@@ -341,28 +341,28 @@ $('save').onclick = function(){
 };
 
 $('wake').onclick = function(){
-  function csend(mode){
-    var t = document.getElementById('ctext').value.trim();
-    if (!t) return;
-    fetch('/' + mode, {method:'POST', headers:{'Content-Type':'application/json'},
-                       body: JSON.stringify({text: t})})
-      .then(function(r){return r.json();})
-      .then(function(d){
-        document.getElementById('cmsg').textContent =
-          d.ok ? (mode === 'say' ? '已发话：' + d.said : '指令已入队，下次唤醒下达') 
-               : ('失败：' + (d.error || '未知'));
-        if (d.ok) document.getElementById('ctext').value = '';
-      })
-      .catch(function(e){ document.getElementById('cmsg').textContent = '请求失败'; });
-  }
-  document.getElementById('saybtn').onclick = function(){ csend('say'); };
-  document.getElementById('instrbtn').onclick = function(){ csend('instruct'); };
-  document.getElementById('ctext').addEventListener('keydown', function(e){
-    if (e.key === 'Enter') csend('instruct');
-  });
   fetch('/wake', {method:'POST'}).then(function(r){return r.json();})
     .then(function(d){ alert(d.msg); refresh(); });
 };
+function csend(mode){
+  var t = document.getElementById('ctext').value.trim();
+  if (!t) return;
+  fetch('/' + mode, {method:'POST', headers:{'Content-Type':'application/json'},
+                     body: JSON.stringify({text: t})})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      document.getElementById('cmsg').textContent =
+        d.ok ? (mode === 'say' ? '已发话：' + d.said : '指令已入队，下次唤醒下达')
+             : ('失败：' + (d.error || '未知'));
+      if (d.ok) document.getElementById('ctext').value = '';
+    })
+    .catch(function(e){ document.getElementById('cmsg').textContent = '请求失败'; });
+}
+document.getElementById('saybtn').onclick = function(){ csend('say'); };
+document.getElementById('instrbtn').onclick = function(){ csend('instruct'); };
+document.getElementById('ctext').addEventListener('keydown', function(e){
+  if (e.key === 'Enter') csend('instruct');
+});
 $('stop').onclick = function(){
   if (!confirm('确认强制停止当前运行？（轮边界生效）')) return;
   fetch('/stop', {method:'POST'}).then(function(r){return r.json();})

@@ -552,5 +552,9 @@ class TestConsoleSpeakInstruct(unittest.TestCase):
 
     def test_ui_has_console_widgets(self):
         from core.daemon import UI_HTML
-        for token in ['id="ctext"', 'id="saybtn"', 'id="instrbtn"', "控制台发话/指令"]:
+        # 布局契约：交流项在观察窗口（feed）之后、csend 为顶层函数（v0.2.1.29 修复嵌套 bug）
+        self.assertGreater(UI_HTML.index('id="ctext"'), UI_HTML.index('id="feed"'))
+        self.assertGreater(UI_HTML.index('function csend'),
+                           UI_HTML.index("$('stop')"))
+        for token in ['id="ctext"', 'id="saybtn"', 'id="instrbtn"', 'agent 交流']:
             self.assertIn(token, UI_HTML)
