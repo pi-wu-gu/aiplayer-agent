@@ -1,0 +1,1157 @@
+# -*- coding: utf-8 -*-
+"""持续运行守护进程（daemon 模式）—— 需求见 README「持续运行模式」。
+
+四大机制：
+1. 聊天监听：轮询桥接 /chat，有人 @提及 bot → 立即唤醒运行（bot 自身发言不触发）
+2. 定时唤醒：每 wake_interval 秒检查积压未读，有积压才触发运行
+3. 周期审查：agent 每跑 review_every 步（默认32）唤醒审查一次；
+   审查（规则 + 可选 LLM）有权强制停止 agent 思考
+4. 唤醒门控：所有唤醒操作仅在 agent 未运行时生效
+   （运行中：提及→记入积压；定时/手动唤醒→跳过并计数）
+
+进程结构：主线程=聊天轮询+调度；worker 线程=跑一次 Agent；
+控制API 线程=HTTP（/status /backlog /wake /stop）。
+状态落盘 logs/daemon_state.json（游标/积压/统计），重启不丢。
+"""
+import json
+import os
+import glob
+import re
+import threading
+import time
+import zlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+import requests
+
+from core import config_loader
+from core import llm_client
+from core.runner import run_task
+
+# 聊天发言者提取：`<name> 内容` / `[world] <name>: 内容`
+_SPEAKER_RE = re.compile(r"<([^>\s]{1,32})>")
+
+# 可通过 UI 热更新的运行参数（cast 为类型转换器；列表型单独处理）
+CONFIG_KEYS = {
+    "poll_interval": float,        # 自动检测频率（聊天轮询间隔，秒）
+    "wake_interval": float,        # 定时唤醒间隔（秒）
+    "review_every": int,           # 每N轮审查
+    "review_llm": bool,            # 审查是否调 LLM
+    "review_token_budget": int,    # 按消耗触发审查（0=关闭，仅按轮数）
+    "max_rounds_per_run": int,     # 单次运行轮次上限
+    "run_cooldown": float,         # 两次运行最小间隔（秒）
+    "backlog_max": int,            # 积压上限
+    "wake_check_backlog": bool,    # 定时唤醒是否只在有积压时运行
+    "say_on_start": bool,          # 启动播报
+}
+CONFIG_LIST_KEYS = ("bot_names", "mention_extra")
+# 配置键 → daemon 属性名（mention_extra 的属性名是 extra_mentions，防写错地方）
+CONFIG_LIST_ATTRS = {"bot_names": "bot_names", "mention_extra": "extra_mentions"}
+# 标量配置键 → daemon 属性名（max_rounds_per_run 运行时属性是 max_rounds，防写错地方）
+CONFIG_KEY_ATTRS = {"max_rounds_per_run": "max_rounds"}
+# 嵌套 cfg 键 → (cfg 段, 段内键)：直接写 self.cfg 对应段（使用点均实时读取 → 热改即生效）
+# session_token_budget：R4 token 熔断阈值（Reviewer.check 每轮实时读 cfg；run_task 开跑前读）
+CONFIG_CFG_KEYS = {
+    "session_token_budget": ("cost_guard", "session_token_budget"),
+}
+
+# ---------------------------------------------------------------- UI 面板
+# 单页嵌入式 HTML（无外部依赖）：状态展示 / 参数热设置 / 思考与工具调用实时观察
+UI_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>MC Agent 守护进程控制台</title>
+<style>
+  :root{
+    --bg:#FFF8EC; --panel:#FFFDF6; --ink:#4A2C20; --ink2:#8A6A52;
+    --line:#E5D5BD; --accent:#B0713A; --ok:#3E7C4F; --bad:#B03A2E;
+    --run:#C0392B; --idle:#3E7C4F;
+  }
+  *{box-sizing:border-box; border-radius:0 !important;}
+  body{margin:0; background:var(--bg); color:var(--ink);
+       font:14px/1.55 "Microsoft YaHei","PingFang SC",sans-serif;}
+  header{display:flex; align-items:center; gap:14px; padding:12px 18px;
+         background:var(--panel); border-bottom:2px solid var(--line);}
+  header h1{font-size:17px; margin:0; font-weight:700;}
+  #badge{padding:3px 12px; border:2px solid var(--idle); color:var(--idle);
+         font-weight:700; font-size:13px; letter-spacing:1px;}
+  #badge.running{border-color:var(--run); color:var(--run); animation:blink 1s infinite;}
+  @keyframes blink{50%{opacity:.45;}}
+  #meta{color:var(--ink2); font-size:12px; margin-left:auto;}
+  .wrap{display:grid; grid-template-columns: 340px 1fr 300px; gap:12px; padding:12px;}
+  .card{background:var(--panel); border:2px solid var(--line); padding:12px;}
+  .card h2{font-size:13px; margin:0 0 10px; color:var(--accent); letter-spacing:2px;
+           border-bottom:1px solid var(--line); padding-bottom:6px;}
+  .stats{display:grid; grid-template-columns:1fr 1fr; gap:6px;}
+  .stat{border:1px solid var(--line); padding:6px 8px; background:#fff;}
+  .stat b{display:block; font-size:19px;}
+  .stat span{font-size:11px; color:var(--ink2);}
+  .stat.warn b{color:var(--bad);}
+  label{display:block; font-size:12px; color:var(--ink2); margin:8px 0 2px;}
+  input[type=text],input[type=number]{width:100%; padding:5px 7px; border:1.5px solid var(--line);
+       background:#fff; color:var(--ink); font-size:13px;}
+  input[type=checkbox]{accent-color:var(--accent);}
+  .row{display:flex; gap:8px; align-items:center;}
+  .row label{margin:0; flex:1;}
+  button{padding:7px 14px; border:2px solid var(--accent); background:var(--accent);
+         color:#fff; font-size:13px; cursor:pointer; font-weight:600;}
+  button.ghost{background:#fff; color:var(--accent);}
+  button.danger{border-color:var(--bad); background:var(--bad);}
+  button:disabled{opacity:.45; cursor:not-allowed;}
+  #btns{display:flex; gap:8px; margin-top:12px;}
+  #saved{color:var(--ok); font-size:12px; margin-left:8px;}
+  #feed{height:calc(100vh - 210px); overflow-y:auto; border:1px solid var(--line);
+        background:#fff; padding:8px; font-size:12.5px;}
+  .ev{margin:0 0 7px; padding:5px 8px; border-left:4px solid var(--line); background:#FFFEFA;}
+  .ev .t{color:var(--ink2); font-size:11px; margin-right:6px;}
+  .ev .tag{display:inline-block; padding:0 6px; font-size:11px; font-weight:700;
+           border:1px solid currentColor; margin-right:6px;}
+  .ev.think{border-left-color:var(--accent);} .ev.think .tag{color:var(--accent);}
+  .ev.tool{border-left-color:#5B7FA6;} .ev.tool .tag{color:#5B7FA6;}
+  .ev.stop{border-left-color:var(--bad); background:#FDF2F0;} .ev.stop .tag{color:var(--bad);}
+  .ev.misc{border-left-color:var(--ink2);} .ev.misc .tag{color:var(--ink2);}
+  .ev.review{border-left-color:#3E8E5A; background:#F1F8F2;} .ev.review .tag{color:#3E8E5A;}
+  .ev .res{color:var(--ink2); font-size:11.5px; margin-top:2px; word-break:break-all;}
+  /* 思考事件折叠：默认只显示开头，点击整行展开全文/推理链（状态跨刷新保持） */
+  .ev.think{cursor:pointer;}
+  .ev.think .full{display:none; white-space:pre-wrap; word-break:break-word;}
+  .ev.think.open .clamp{display:none;}
+  .ev.think.open .full{display:inline;}
+  .ev.think .rsn{display:none; color:var(--ink2); font-size:11.5px; line-height:1.5;
+                 margin-top:4px; padding:4px 7px; background:#FBF5E8;
+                 border:1px dashed var(--line); white-space:pre-wrap; word-break:break-word;}
+  .ev.think.open .rsn{display:block;}
+  .ev.think .tog{color:var(--accent); font-size:11px; margin-left:5px; font-weight:700;}
+  .ev.think .tog.open-only{display:none;}
+  .ev.think.open .tog.open-only{display:inline;}
+  .ev.think.open .tog.closed-only{display:none;}
+  button.mini{padding:2px 9px; font-size:12px; font-weight:400;}
+  #feedtools{display:flex; gap:6px; align-items:center;}
+  #blist{max-height:200px; overflow-y:auto; border:1px solid var(--line); background:#fff;
+         padding:6px; font-size:12px;}
+  #blist div{padding:2px 0; border-bottom:1px dashed var(--line);}
+  #blist .m{color:var(--bad); font-weight:700;}
+  select{padding:4px; border:1.5px solid var(--line); background:#fff;}
+  .hint{font-size:11px; color:var(--ink2); margin-top:10px; line-height:1.6;}
+</style>
+</head>
+<body>
+<header>
+  <h1>MC AGENT 守护进程控制台</h1>
+  <span id="badge">IDLE</span>
+  <span id="meta"></span>
+</header>
+<div class="wrap">
+  <!-- 左列：运行参数 -->
+  <div class="card">
+    <h2>运行参数（保存即热生效）</h2>
+    <label>自动检测频率 poll_interval（秒，聊天轮询）</label>
+    <input type="number" id="poll_interval" step="0.5" min="0.5">
+    <label>定时唤醒间隔 wake_interval（秒）</label>
+    <input type="number" id="wake_interval" step="10" min="10">
+    <div class="row"><label><input type="checkbox" id="wake_check_backlog"> 定时唤醒仅在有积压时运行</label></div>
+    <label>审查周期 review_every（轮）</label>
+    <input type="number" id="review_every" step="1" min="1">
+    <div class="row"><label><input type="checkbox" id="review_llm"> 审查额外调用 LLM</label></div>
+    <label>单次运行轮次上限 max_rounds_per_run</label>
+    <input type="number" id="max_rounds_per_run" step="1" min="1">
+    <label>运行冷却 run_cooldown（秒）</label>
+    <input type="number" id="run_cooldown" step="1" min="0">
+    <label>积压上限 backlog_max（条）</label>
+    <input type="number" id="backlog_max" step="10" min="10">
+    <label>提及名 bot_names（逗号分隔）</label>
+    <input type="text" id="bot_names">
+    <label>额外触发词 mention_extra（逗号分隔）</label>
+    <input type="text" id="mention_extra">
+    <label>会话 token 上限 session_token_budget（0=关闭熔断）</label>
+    <input type="number" id="session_token_budget" step="1000" min="0">
+    <label>按消耗提前审查 review_token_budget（0=仅按轮数）</label>
+    <input type="number" id="review_token_budget" step="1000" min="0">
+    <div id="btns">
+      <button id="save">保存参数</button><span id="saved"></span>
+    </div>
+    <div class="hint">参数立即生效并写入 daemon_state.json，重启后自动恢复。
+      自动检测频率越小反应越快，但轮询越频。
+      两个 token 参数为 cost_guard 热改：上限超出即熔断停止，0=关闭。</div>
+  </div>
+  <!-- 中列：实时行为流 -->
+  <div class="card">
+    <h2>实时观察 · 思考与工具调用
+      <span id="feedtools" style="float:right">
+        <button class="ghost mini" id="expandAll">展开全部</button>
+        <button class="ghost mini" id="collapseAll">折叠全部</button>
+        <select id="refresh">
+          <option value="1000">刷新1s</option>
+          <option value="2000" selected>刷新2s</option>
+          <option value="5000">刷新5s</option>
+          <option value="10000">刷新10s</option>
+        </select>
+      </span>
+    </h2>
+    <div id="feed"></div>
+  </div>
+  <!-- 右列：状态与控制 -->
+  <div class="card">
+    <h2>状态</h2>
+    <div class="stats" id="stats"></div>
+    <div id="btns" style="margin-top:12px">
+      <button id="wake">立即唤醒</button>
+      <button id="stop" class="danger">强制停止</button>
+    </div>
+    <h2 style="margin-top:16px">积压未读</h2>
+    <div id="blist"></div>
+  </div>
+</div>
+<script>
+var REFRESH = 2000, timer = null;
+function $(id){ return document.getElementById(id); }
+function esc(s){ var d=document.createElement('div'); d.textContent=s==null?'':s; return d.innerHTML; }
+
+function renderStatus(st){
+  var b = $('badge');
+  b.textContent = st.running ? 'RUNNING' : 'IDLE';
+  b.className = st.running ? 'running' : '';
+  var s = st.stats;
+  $('meta').textContent = '运行' + Math.round(st.uptime_sec) + 's · 游标' + st.cursor +
+      ' · ' + (st.running ? ('触发:' + (st.current_reason||'')) : '待命');
+  var cells = [
+    ['总运行', s.runs||0, ''], ['提及唤醒', s.mention_runs||0, ''],
+    ['定时唤醒', s.scheduled_runs||0, ''], ['手动唤醒', s.manual_runs||0, ''],
+    ['审查停止', s.review_stops||0, (s.review_stops||0)>0?'warn':''],
+    ['门控拦截', s.wake_blocked_running||0, ''],
+    ['积压未读', st.backlog_n, st.backlog_n>20?'warn':''],
+    ['待处理提及', st.mention_pending?'有':'无', st.mention_pending?'warn':'']
+  ];
+  $('stats').innerHTML = cells.map(function(c){
+    return '<div class="stat '+c[2]+'"><b>'+esc(c[1])+'</b><span>'+c[0]+'</span></div>';
+  }).join('');
+  $('wake').disabled = st.running;
+  $('stop').disabled = !st.running;
+}
+
+var EXPANDED = {};      // uid → true：思考事件展开状态（跨刷新保持）
+var lastFeed = {events:[]};
+
+function renderFeed(d){
+  lastFeed = d || {events:[]};
+  var box = $('feed');
+  var wasBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+  var html = (d.events||[]).map(function(e){
+    var cls = e.event==='llm_response' ? 'think' :
+              e.event==='tool_call' ? 'tool' :
+              (e.event==='force_stopped'||e.event==='review_force_stop'||
+               e.event==='cost_guard_triggered') ? 'stop' :
+              e.event==='review_pass' ? 'review' : 'misc';
+    var uid = e.uid || ((e.ts||'')+'|'+(e.event||''));
+    var head = '<p class="ev '+cls+(e.event==='llm_response' && EXPANDED[uid] ? ' open' : '')+
+        '" data-uid="'+esc(uid)+'"><span class="t">'+(e.ts||'').slice(11,19)+
+        ' R'+(e.round==null?'-':e.round)+'</span><span class="tag">'+esc(e.kind)+'</span>';
+    if (e.event === 'llm_response') {
+      // 思考事件：默认折叠显示开头，点击整行展开全文+推理链（EXPANDED 跨刷新保持）
+      var t = e.text || '';
+      var short_ = t.length > 70 ? esc(t.slice(0, 70)) + '…' : esc(t);
+      var rsn = e.reasoning
+          ? ('<div class="rsn">【推理链】'+esc(e.reasoning)+'</div>') : '';
+      return head +
+          '<span class="clamp">'+short_+'</span>' +
+          '<span class="full">'+esc(t)+rsn+'</span>' +
+          '<span class="tog closed-only">展开▸</span><span class="tog open-only">收起▾</span>' +
+          (e.tokens?(' <span class="t">'+e.tokens+'tok '+(e.elapsed||'')+'s</span>'):'')+'</p>';
+    }
+    return head + esc(e.text||'') + (e.tokens?(' <span class="t">'+e.tokens+'tok '+(e.elapsed||'')+'s</span>'):'')+
+        (e.elapsed && e.event!=='llm_response'?(' <span class="t">'+e.elapsed+'s</span>'):'')+
+        (e.result?('<div class="res">→ '+esc(e.result)+'</div>'):'')+'</p>';
+  }).join('');
+  box.innerHTML = html || '<p class="ev misc">（暂无行为记录）</p>';
+  if (wasBottom) box.scrollTop = box.scrollHeight;
+}
+
+// 思考行点击展开/折叠（事件委托，innerHTML 重渲染后依然有效）
+$('feed').addEventListener('click', function(ev){
+  var p = ev.target && ev.target.closest ? ev.target.closest('.ev.think') : null;
+  if (!p) return;
+  var uid = p.getAttribute('data-uid');
+  EXPANDED[uid] = !EXPANDED[uid];
+  p.classList.toggle('open');
+});
+$('expandAll').onclick = function(){
+  (lastFeed.events||[]).forEach(function(e){
+    EXPANDED[e.uid || ((e.ts||'')+'|'+(e.event||''))] = true; });
+  renderFeed(lastFeed);
+};
+$('collapseAll').onclick = function(){
+  (lastFeed.events||[]).forEach(function(e){
+    EXPANDED[e.uid || ((e.ts||'')+'|'+(e.event||''))] = false; });
+  renderFeed(lastFeed);
+};
+
+function renderBacklog(d){
+  var items = (d.backlog||[]).slice(-12).reverse();
+  $('blist').innerHTML = items.map(function(e){
+    var m = e.mention ? '<span class="m">[@]</span> ' : '';
+    return '<div>'+m+esc((e.text||'').slice(0,60))+'</div>';
+  }).join('') || '<div style="color:var(--ink2)">（无积压）</div>';
+}
+
+function refresh(){
+  fetch('/status').then(function(r){return r.json();}).then(renderStatus).catch(function(){});
+  fetch('/feed?n=80').then(function(r){return r.json();}).then(renderFeed).catch(function(){});
+  fetch('/backlog').then(function(r){return r.json();}).then(renderBacklog).catch(function(){});
+}
+
+function loadConfig(){
+  fetch('/config').then(function(r){return r.json();}).then(function(d){
+    var c = d.config||{};
+    for (var k in c){
+      var el = $(k);
+      if (!el) continue;
+      if (el.type === 'checkbox') el.checked = !!c[k];
+      else if (Array.isArray(c[k])) el.value = c[k].join(',');
+      else el.value = c[k];
+    }
+  }).catch(function(){});
+}
+
+$('save').onclick = function(){
+  var body = {};
+  ['poll_interval','wake_interval','review_every','review_token_budget','max_rounds_per_run','run_cooldown','backlog_max','session_token_budget']
+    .forEach(function(k){ var el=$(k); if (el && el.value!=='') body[k] = el.value; });
+  ['wake_check_backlog','review_llm'].forEach(function(k){ body[k] = $(k).checked; });
+  body.bot_names = $('bot_names').value.split(/[,，]/).map(function(s){return s.trim();}).filter(Boolean);
+  body.mention_extra = $('mention_extra').value.split(/[,，]/).map(function(s){return s.trim();}).filter(Boolean);
+  fetch('/config', {method:'POST', headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify(body)})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      $('saved').textContent = d.ok ? ('已生效' + (Object.keys(d.changed||{}).length?
+          '('+Object.keys(d.changed).length+'项)' : '')) : '失败';
+      setTimeout(function(){ $('saved').textContent=''; }, 2500);
+    }).catch(function(){ $('saved').textContent='网络错误'; });
+};
+
+$('wake').onclick = function(){
+  fetch('/wake', {method:'POST'}).then(function(r){return r.json();})
+    .then(function(d){ alert(d.msg); refresh(); });
+};
+$('stop').onclick = function(){
+  if (!confirm('确认强制停止当前运行？（轮边界生效）')) return;
+  fetch('/stop', {method:'POST'}).then(function(r){return r.json();})
+    .then(function(d){ alert(d.msg); });
+};
+$('refresh').onchange = function(){
+  REFRESH = parseInt(this.value, 10);
+  if (timer) clearInterval(timer);
+  timer = setInterval(refresh, REFRESH);
+};
+
+loadConfig(); refresh();
+timer = setInterval(refresh, REFRESH);
+</script>
+</body>
+</html>
+"""
+
+
+def parse_speaker(text):
+    """取聊天条目中的发言者名；无 <name> 结构返回 None（系统消息）。"""
+    if not text:
+        return None
+    m = _SPEAKER_RE.search(text)
+    return m.group(1) if m else None
+
+
+def _fmt_ts(t):
+    try:
+        return time.strftime("%H:%M:%S", time.localtime(float(t)))
+    except (TypeError, ValueError):
+        return "--:--:--"
+
+
+class Reviewer:
+    """行为审查器：每 review_every 轮审查一次，有权返回停止原因（强制停止思考）。"""
+
+    def __init__(self, daemon):
+        self.d = daemon
+        self.cfg = daemon.cfg
+        self.last_review_round = 0
+        self.last_review_tokens = 0   # 上次审查时的累计消耗（含次级）
+        log_dir = os.path.join(config_loader.AGENT_ROOT, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        self.jsonl_path = os.path.join(
+            log_dir, "review_%s.jsonl" % time.strftime("%Y%m%d"))
+
+    # ---------- 主入口（Agent.round_hook） ----------
+    def reset(self):
+        """每次唤醒运行开始时调用：审查计数按"次"计量，不跨运行累计
+        （否则第二次起永远达不到间隔，token 保险丝也会失效）。"""
+        self.last_review_round = 0
+        self.last_review_tokens = 0
+
+    def check(self, round_no, agent):
+        """到点才审。返回 None=继续；非空字符串=强制停止原因。
+        触发条件（满足其一）：①距上次审查 ≥ review_every 轮；
+        ②★自上次审查以来累计消耗 ≥ review_token_budget（配置 >0 时启用，v0.2.1.7 框架侧）。"""
+        used_now = (agent.total_tokens or 0) + (agent.sub_tokens or 0)
+        due_round = round_no - self.last_review_round >= self.d.review_every
+        due_tokens = (self.d.review_token_budget > 0
+                      and used_now - self.last_review_tokens >= self.d.review_token_budget)
+        if not (due_round or due_tokens):
+            return None
+        self.last_review_round = round_no
+        self.last_review_tokens = used_now
+        reasons = []
+        recent = list(agent.recent_results)
+        hp = self.d.query_health()
+
+        # R1 同一操作连续 3 次失败（工具+参数完全一致）
+        if len(recent) >= 3:
+            last3 = recent[-3:]
+            if (all((not r["ok"]) for r in last3)
+                    and len({(r["tool"], r["args"]) for r in last3}) == 1):
+                reasons.append("同一操作连续3次失败: %s %s"
+                               % (last3[0]["tool"], last3[0]["args"][:60]))
+        # R2 最近 6 次操作全部失败
+        if len(recent) >= 6 and all(not r["ok"] for r in recent[-6:]):
+            reasons.append("连续6次操作均失败")
+        # R3 生命值红线（直查桥接，不花 token）
+        if hp is not None and hp < 10:
+            reasons.append("生命值 %s < 10，触发避险红线" % hp)
+        # R4 token 熔断
+        budget = (self.cfg.get("cost_guard") or {}).get("session_token_budget")
+        used = (agent.total_tokens or 0) + (agent.sub_tokens or 0)
+        if budget and used > budget:
+            reasons.append("token 用量 %d 超出会话预算 %d" % (used, budget))
+        # R5 可选 LLM 审查（默认关闭，省 token；规则全过才问）
+        if self.d.review_llm and not reasons:
+            llm_verdict = self._llm_review(agent)
+            if llm_verdict:
+                reasons.append("LLM审查: %s" % llm_verdict)
+
+        verdict = "；".join(reasons)[:200] if reasons else None
+        self._record(round_no, verdict, reasons, hp, used)
+        # 审查记录只写 review_*.jsonl（由 _record 保证落盘）；/feed 直接合并该文件，
+        # 不再写 behavior 日志（避免与 agent.logger 管线错位导致重复/丢失）。
+        if verdict:
+            self.d.stats["review_stops"] += 1
+            self.d.log("审查(第%d轮)要求强制停止: %s" % (round_no, verdict))
+        else:
+            self.d.log("审查(第%d轮): 通过（最近%d次操作/token=%d/生命=%s）"
+                       % (round_no, len(recent), used, hp))
+        return verdict
+
+    # ---------- LLM 审查 ----------
+    def _llm_review(self, agent):
+        digest_lines = []
+        for r in list(agent.recent_results)[-self.d.review_every:]:
+            digest_lines.append("R%d %s %s | %s | %s" % (
+                r["round"], r["tool"], r["args"][:80],
+                "成功" if r["ok"] else "失败", r["head"][:80].replace("\n", " ")))
+        digest = "\n".join(digest_lines) or "（暂无工具调用记录）"
+        messages = [
+            {"role": "system", "content":
+             "你是 MC 游戏 agent 的行为审查员。根据最近的操作记录判断 agent 是否陷入"
+             "死循环/反复失败/危险操作。只回复一行：正常则回复「继续」；"
+             "有问题则回复「停止:原因」（原因不超过30字）。"},
+            {"role": "user", "content": "最近操作记录：\n%s" % digest},
+        ]
+        try:
+            resp = llm_client.chat(self.cfg, model=self.d.review_model,
+                                   messages=messages, max_tokens=256, temperature=0.2)
+            text = (resp.get("content") or "").strip()
+            if text.startswith("停止"):
+                return text[2:].lstrip(":： ")[:60] or "行为异常"
+            return None
+        except Exception as e:
+            self.d.log("LLM 审查调用失败(%s)，按规则结果处理" % str(e)[:80])
+            return None
+
+    # ---------- 记录 ----------
+    def _record(self, round_no, verdict, reasons, hp, tokens):
+        rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "round": round_no,
+               "verdict": verdict, "reasons": reasons, "hp": hp, "tokens": tokens}
+        try:
+            with open(self.jsonl_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+
+class _ControlHandler(BaseHTTPRequestHandler):
+    """daemon 控制 API（默认 8770 端口）。"""
+    daemon = None          # 由 Daemon 启动时注入
+    server_version = "AIBridgeDaemon/1.0"
+
+    def log_message(self, *args):
+        pass
+
+    def _json(self, code, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def _html(self, code, text):
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/ui"):
+            self._html(200, UI_HTML)
+        elif path == "/status":
+            self._json(200, self.daemon.status())
+        elif path == "/backlog":
+            self._json(200, {"backlog": self.daemon.backlog_snapshot(),
+                             "n": len(self.daemon.backlog_snapshot())})
+        elif path == "/feed":
+            n = 60
+            if "?" in self.path:
+                try:
+                    n = int(parse_qs(urlparse(self.path).query).get("n", ["60"])[0])
+                except (ValueError, IndexError):
+                    pass
+            self._json(200, self.daemon.feed(n))
+        elif path == "/config":
+            self._json(200, {"config": self.daemon.config_get()})
+        else:
+            self._json(404, {"error": "unknown path"})
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(n) if n > 0 else b""
+            data = json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception:
+            data = {}
+        if path == "/wake":
+            # 唤醒门控：仅未运行才能生效
+            if self.daemon.running:
+                self.daemon.stats["wake_blocked_running"] += 1
+                return self._json(409, {"ok": False,
+                                        "msg": "agent 运行中，唤醒未生效（门控：需未运行）"})
+            self.daemon.wake_now.set()
+            self._json(200, {"ok": True, "msg": "唤醒已接受，下个轮询周期触发"})
+        elif path == "/stop":
+            # 强制停止思考（与控制API/审查同一 stop_event 机制）
+            if not self.daemon.running:
+                return self._json(409, {"ok": False, "msg": "当前无运行，无需停止"})
+            self.daemon.stop_event.set()
+            self._json(200, {"ok": True, "msg": "已发送强制停止信号（轮边界生效）"})
+        elif path == "/config":
+            changed = self.daemon._apply_overrides(data)
+            self._json(200, {"ok": True, "changed": changed,
+                             "config": self.daemon.config_get()})
+        else:
+            self._json(404, {"error": "unknown path"})
+
+
+class Daemon:
+    """持续运行守护进程。"""
+
+    def __init__(self, cfg, verbose=True):
+        self.cfg = cfg
+        self.verbose = verbose
+        dcfg = cfg.get("daemon") or {}
+        self.bot_names = list(dcfg.get("bot_names") or ["muyiyangDeepseek"])
+        self.extra_mentions = list(dcfg.get("mention_extra") or [])
+        self.poll_interval = float(dcfg.get("poll_interval", 2.0))
+        self.wake_interval = float(dcfg.get("wake_interval", 300))
+        self.wake_check_backlog = bool(dcfg.get("wake_check_backlog", True))
+        self.review_every = int(dcfg.get("review_every", 32))
+        # ★按消耗量触发审查：自上次审查以来累计 token 超过该值就提前审（0=关闭，仅按轮数）
+        self.review_token_budget = int(dcfg.get("review_token_budget", 0))
+        # 可选项：AI 自管唤醒词（默认关闭）——存 config/wake_words.json，文件 mtime 变化自动重载
+        self.allow_ai_wake_words = bool(dcfg.get("allow_ai_wake_words"))
+        self.ai_wake_words = []
+        self._ww_mtime = 0.0
+        self.ai_wake_words = self._refresh_ai_wake_words()
+        self.review_llm = bool(dcfg.get("review_llm", False))
+        self.review_model = dcfg.get("review_model") or cfg["defaults"].get("model")
+        self.run_cooldown = float(dcfg.get("run_cooldown", 5))
+        self.max_rounds = int(dcfg.get("max_rounds_per_run", 60))
+        self.control_port = int(dcfg.get("control_port", 8770))
+        self.backlog_max = int(dcfg.get("backlog_max", 200))
+        self.initial_backlog = bool(dcfg.get("initial_backlog", False))
+        self.say_on_start = bool(dcfg.get("say_on_start", True))
+        self.state_path = os.path.join(
+            config_loader.AGENT_ROOT,
+            dcfg.get("state_path", "logs/daemon_state.json"))
+        self.base = (cfg.get("mc_bridge", {}).get("base_url")
+                     or "http://127.0.0.1:8780").rstrip("/")
+
+        self.lock = threading.RLock()
+        self.running = False
+        self.current_task = None
+        self.current_reason = None
+        self.stop_event = threading.Event()
+        self.wake_now = threading.Event()
+        self.backlog = []
+        self.cursor = 0
+        self.last_wake_ts = 0.0
+        self.last_run_end = 0.0
+        self.stats = {"runs": 0, "mention_runs": 0, "scheduled_runs": 0,
+                      "manual_runs": 0, "review_stops": 0,
+                      "wake_blocked_running": 0, "started_at": time.time()}
+        self._stop = False
+        self.reviewer = Reviewer(self)
+        self.overrides = {}          # UI 热更新的参数覆盖（随状态文件持久化）
+        self._load_state()
+
+    # ---------- 日志 ----------
+    def log(self, text):
+        line = "[daemon %s] %s" % (time.strftime("%H:%M:%S"), text)
+        if self.verbose:
+            print(line)
+        try:
+            log_dir = os.path.dirname(self.state_path)
+            os.makedirs(log_dir, exist_ok=True)
+            with open(os.path.join(log_dir, "daemon.log"), "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+    # ---------- 状态持久化 ----------
+    def _load_state(self):
+        try:
+            with open(self.state_path, "r", encoding="utf-8") as f:
+                st = json.load(f)
+            self.cursor = int(st.get("cursor") or 0)
+            self.backlog = list(st.get("backlog") or [])[-self.backlog_max:]
+            for k, v in (st.get("stats") or {}).items():
+                # started_at 不恢复：uptime 应指本次进程运行时长（恢复会跨重启累计，
+                # 控制台"运行Xs"显示成几小时前启动的旧进程）
+                if k == "started_at":
+                    continue
+                if k in self.stats and isinstance(v, (int, float)):
+                    self.stats[k] = v
+            self.last_wake_ts = float(st.get("last_wake_ts") or 0)
+            self.last_run_end = float(st.get("last_run_end") or 0)
+            # 恢复 UI 热更新的参数覆盖（立即生效，无需重启）
+            self._apply_overrides(st.get("config") or {}, persist=False)
+            self.log("状态已恢复: 游标=%d 积压=%d 条" % (self.cursor, len(self.backlog)))
+        except (OSError, ValueError):
+            self.cursor = self._seed_cursor()
+            self.log("首次启动: 游标种子=%d（历史不计积压）" % self.cursor)
+
+    def _save_state(self):
+        with self.lock:
+            st = {"cursor": self.cursor, "backlog": self.backlog[-self.backlog_max:],
+                  "stats": self.stats, "last_wake_ts": self.last_wake_ts,
+                  "last_run_end": self.last_run_end, "config": self.overrides,
+                  "saved_at": time.time()}
+        try:
+            os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+            tmp = self.state_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(st, f, ensure_ascii=False)
+            os.replace(tmp, self.state_path)
+        except OSError:
+            pass
+
+    def _seed_cursor(self):
+        """首启取当前最新 chat id 作游标（除非配置 initial_backlog）。"""
+        if self.initial_backlog:
+            return 0
+        try:
+            r = requests.get(self.base + "/chat",
+                             params={"since": 0, "limit": 1}, timeout=8)
+            d = r.json()
+            return int(d.get("latest_id") or 0)
+        except Exception:
+            return 0
+
+    # ---------- 聊天轮询 / 提及检测 ----------
+    def _fetch_chat(self, since, limit=100):
+        try:
+            r = requests.get(self.base + "/chat",
+                             params={"since": since, "limit": limit}, timeout=8)
+            return r.json()
+        except requests.RequestException:
+            return {"entries": [], "latest_id": self.cursor}
+
+    def is_mention(self, text):
+        """他人发言中提到 bot 才算提及；bot 自己的 say 不触发（防自激循环）。"""
+        if not text:
+            return False
+        speaker = parse_speaker(text)
+        if speaker and speaker in self.bot_names:
+            return False
+        if any(b in text for b in self.bot_names):
+            return True
+        low = text.lower()
+        if any(k.lower() in low for k in self.extra_mentions):
+            return True
+        # AI 自管唤醒词（可选，allow_ai_wake_words；防御式读取——旧构造路径可能没初始化）
+        return any(k.lower() in low for k in (getattr(self, "ai_wake_words", None) or []))
+
+    def _refresh_ai_wake_words(self):
+        """重载 AI 自管唤醒词（开关关闭 → 恒空表；文件 mtime 变化才重读，避免每行聊天都读盘）。"""
+        if not self.allow_ai_wake_words:
+            self.ai_wake_words = []
+            return self.ai_wake_words
+        from tools.builtin import wake_words as ww
+        p = ww.store_path()
+        try:
+            m = os.path.getmtime(p) if os.path.isfile(p) else 0.0
+        except OSError:
+            m = 0.0
+        if m != self._ww_mtime:
+            self._ww_mtime = m
+            self.ai_wake_words = ww._load()
+        return self.ai_wake_words
+
+    def poll_chat(self):
+        d = self._fetch_chat(self.cursor)
+        entries = d.get("entries") or []
+        if not entries:
+            return []
+        self._refresh_ai_wake_words()   # 每次轮询至多重载一次（agent 加词后 ~2 秒内生效）
+        with self.lock:
+            for e in entries:
+                text = e.get("text") or ""
+                self.backlog.append({"id": e.get("id"), "t": e.get("t"),
+                                     "text": text, "mention": self.is_mention(text)})
+            if len(self.backlog) > self.backlog_max:
+                self.backlog = self.backlog[-self.backlog_max:]
+            self.cursor = max(self.cursor, int(entries[-1].get("id") or 0))
+            n_mention = sum(1 for e in self.backlog if e.get("mention"))
+        self._save_state()
+        new_mentions = [e for e in entries if self.is_mention(e.get("text") or "")]
+        if new_mentions:
+            self.log("检测到 @提及 x%d: %s" % (len(new_mentions),
+                                              new_mentions[-1].get("text", "")[:60]))
+        self.log("聊天+%d 条（积压%d，含提及%d）"
+                 % (len(entries), len(self.backlog), n_mention))
+        return entries
+
+    # ---------- 唤醒决策 ----------
+    def _has_mention(self):
+        with self.lock:
+            return any(e.get("mention") for e in self.backlog)
+
+    def _wake_allowed(self):
+        """唤醒门控：仅未运行 + 度过冷却才允许触发。"""
+        if self.running:
+            return False
+        return (time.time() - self.last_run_end) >= self.run_cooldown
+
+    def _scheduled_wake(self):
+        if self.running:
+            self.stats["wake_blocked_running"] += 1
+            self.log("定时唤醒到点，但 agent 运行中 → 跳过（门控）")
+            return
+        with self.lock:
+            has_backlog = bool(self.backlog)
+            n = len(self.backlog)
+        if not has_backlog and self.wake_check_backlog:
+            self.log("定时唤醒：无积压未读，无需运行")
+            return
+        self._trigger("scheduled")
+
+    def _trigger(self, reason):
+        with self.lock:
+            snapshot = list(self.backlog)
+        task = self._build_task(reason, snapshot)
+        self.current_task = task
+        self.current_reason = reason
+        # 每次运行用新的 stop_event（上次的停止信号不得残留）
+        self.stop_event = threading.Event()
+        self.running = True
+        self.stats["runs"] += 1
+        self.stats["%s_runs" % reason] = self.stats.get("%s_runs" % reason, 0) + 1
+        self.last_wake_ts = time.time()
+        self._save_state()
+        th = threading.Thread(target=self._run_worker,
+                              args=(reason, task, snapshot), daemon=True)
+        th.start()
+
+    def _build_task(self, reason, snapshot):
+        mentions = [e for e in snapshot if e.get("mention")]
+        lines = []
+        if reason == "mention" and mentions:
+            lines.append("【游戏内@提及】%s" % mentions[-1].get("text", ""))
+            lines.append("（唤醒原因：游戏内有人提到你，本次由持续运行守护进程自动启动）")
+        elif reason == "scheduled":
+            lines.append("【定时唤醒】按计划检查积压未读消息，处理需要回应的事项")
+        else:
+            lines.append("【手动唤醒】操作者通过控制API(:%d /wake)手动唤醒" % self.control_port)
+        if snapshot:
+            lines.append("积压未读共 %d 条，最近几条：" % len(snapshot))
+            for e in snapshot[-10:]:
+                lines.append("  %s %s" % (_fmt_ts(e.get("t")), e.get("text", "")))
+            if len(snapshot) > 10:
+                lines.append("  （更早的可用 mc_chat 查看）")
+        else:
+            lines.append("（无积压未读；如无待办事项，简短说明现状即可收尾）")
+        lines.append("要求：中文简短汇报；结束时不发游戏消息（session_stats 数字写进汇报即可）；不要反问我是否继续。")
+        return "\n".join(lines)
+
+    # ---------- worker ----------
+    def _run_worker(self, reason, task, snapshot):
+        t0 = time.time()
+        stats = None
+        try:
+            self.reviewer.reset()  # 审查计数按次计量（修：跨运行累计导致第2次起不审查）
+            # 游戏离线降级：mc_* 全部 fast-fail —— 提前告知 agent，游戏类任务自行汇报挂起，
+            # 非游戏工作（记忆整理/定时调研）照常进行（探活有缓存，开销可忽略）
+            try:
+                from tools.builtin.mc_bridge import game_online
+                online, note = game_online(self.cfg)
+                if not online:
+                    task = "【系统提示：%s。mc_state/mc_act/mc_chat 暂不可用——" \
+                           "若任务必须游戏感知或动作，用最终汇报说明「游戏离线已挂起」，" \
+                           "不要反复重试；纯非游戏工作照常完成。】\n%s" % (note, task)
+                    self.log("唤醒运行[%s] 游戏离线降级: %s" % (reason, note))
+            except Exception:
+                pass  # 探活自身失败不阻断运行（后续 mc 调用会得到明确错误）
+
+            # ★客户端活着但没进世界时**跳过运行**（2026-10-16 实测：控制面 8780 在线 →
+            # game_online=True，于是每次唤醒照跑完整会话，而感知/动作/聊天全不可用，
+            # 单次白烧 15 万 token 只为输出一句"离线挂起"。连不上服务器时每小时能白烧上百万）
+            try:
+                st = requests.get(self.base + "/state", timeout=5).json()
+                if st.get("loaded") is False:
+                    self.log("唤醒运行[%s] 跳过: 客户端未进入世界（%s），不消耗 token"
+                             % (reason, st.get("note") or "loaded=false"))
+                    self._say_offline_once()
+                    return
+            except requests.RequestException:
+                pass
+            self.log("唤醒运行[%s] 开始: %s" % (reason, task[:70].replace("\n", " ")))
+            out, stats = run_task(self.cfg, task, max_rounds=self.max_rounds,
+                                  round_hook=self.reviewer.check,
+                                  stop_event=self.stop_event, verbose=True,
+                                  trigger=reason)
+            blocked = bool(stats.get("blocked"))
+            if blocked:
+                # 护栏拦截未运行 → 积压原样放回（按 id 去重，保持顺序）
+                with self.lock:
+                    have = {e.get("id") for e in self.backlog}
+                    self.backlog = ([e for e in snapshot if e.get("id") not in have]
+                                    + self.backlog)[-self.backlog_max:]
+                self._save_state()
+                # 收尾不再发游戏消息（2026-10-17 用户要求）：以下各项只写 daemon 日志
+                self.log("运行被成本护栏拦截: %s" % stats.get("reason", "")[:80])
+            else:
+                # 正式运行过 → 消费快照部分（运行期间新到的消息保留为积压）
+                with self.lock:
+                    ids = {e.get("id") for e in snapshot}
+                    self.backlog = [e for e in self.backlog
+                                    if e.get("id") not in ids][-self.backlog_max:]
+                self._save_state()
+                # 运行结束只记录日志，不再 say 播报（收尾播报已按用户要求去除）
+                if out and out.startswith("(审查强制停止"):
+                    self.log("运行结束: 审查强制停止 %s" % out[7:80])
+                elif out and out.startswith("(达到最大轮数"):
+                    self.log("运行结束: 达到轮数上限 %s" % out[7:80])
+                elif out and out.startswith("(被外部强制停止"):
+                    self.log("运行结束: 被手动强制停止")
+        except Exception as e:
+            self.log("运行异常: %s" % str(e)[:200])
+            # ★连续失败退避：防止"任务秒崩→mention 不消费→立即再唤醒"的风暴
+            # （实例：keys 为模板占位 → LLM 全崩 → 6 秒一次 say 刷屏）
+            self._consecutive_failures = getattr(self, "_consecutive_failures", 0) + 1
+            if self._consecutive_failures >= 3:
+                cooldown = min(60 * self._consecutive_failures, 300)
+                self.log("连续失败 %d 次，冷却 %ds 防风暴" % (self._consecutive_failures, cooldown))
+                time.sleep(cooldown)
+        else:
+            self._consecutive_failures = 0
+        finally:
+            # ★任何出口（含"未进世界"提前 return / 异常）都必须复位运行状态——
+            # 2026-10-17 部署时实测：提前 return 绕过复位 → daemon 永久卡在 running=True，
+            # 门控把之后所有唤醒全挡掉（"定时唤醒到点，但 agent 运行中"），只能重启恢复
+            self.running = False
+            self.current_task = None
+            self.current_reason = None
+            self.last_run_end = time.time()
+            self._save_state()
+            self.log("唤醒运行[%s] 结束: 耗时%.1fs 轮次=%s" %
+                     (reason, time.time() - t0,
+                      stats.get("rounds") if isinstance(stats, dict) else "?"))
+
+    # ---------- 游戏内 say ----------
+    def _say(self, text):
+        try:
+            requests.post(self.base + "/command",
+                          json={"commands": [{"type": "say", "text": text[:100]}]},
+                          timeout=8)
+        except requests.RequestException:
+            pass
+
+    def _say_offline_once(self):
+        """未进世界时播报一次（带 10 分钟冷却，避免每次唤醒都刷屏）。"""
+        now = time.time()
+        if now - getattr(self, "_last_offline_say", 0) < 600:
+            return
+        self._last_offline_say = now
+        self._say("[自动] 游戏没连上服务器，我先不烧 token 了，恢复后再干活")
+
+    # ---------- 健康查询（审查用，不花 token） ----------
+    def query_health(self):
+        try:
+            r = requests.get(self.base + "/state", timeout=5)
+            return r.json().get("health")
+        except Exception:
+            return None
+
+    # ---------- 控制API数据 ----------
+    def status(self):
+        with self.lock:
+            backlog_n = len(self.backlog)
+            mention_pending = any(e.get("mention") for e in self.backlog)
+        return {
+            "state": "running" if self.running else "idle",
+            "running": self.running,
+            "current_reason": self.current_reason,
+            "current_task_head": (self.current_task or "")[:120],
+            "backlog_n": backlog_n,
+            "mention_pending": mention_pending,
+            "cursor": self.cursor,
+            "review_every": self.review_every,
+            "wake_interval": self.wake_interval,
+            "stats": self.stats,
+            "uptime_sec": round(time.time() - self.stats["started_at"], 1),
+        }
+
+    def backlog_snapshot(self):
+        with self.lock:
+            return list(self.backlog[-50:])
+
+    # ---------- 运行参数热更新（UI /config） ----------
+    def _apply_overrides(self, data, persist=True):
+        """把 UI 提交的参数立即应用到运行中的 daemon（各使用点均为实时读取）。"""
+        changed = {}
+        for k, cast in CONFIG_KEYS.items():
+            if k not in data:
+                continue
+            try:
+                v = cast(data[k])
+            except (TypeError, ValueError):
+                continue
+            attr = CONFIG_KEY_ATTRS.get(k, k)
+            old = getattr(self, attr, None)
+            if old != v:
+                setattr(self, attr, v)
+                self.overrides[k] = v
+                changed[k] = {"old": old, "new": v}
+        # 嵌套 cfg 键：写 self.cfg 对应段（0=关闭，负值无意义 → clamp 到 ≥0）
+        for k, (sec, ck) in CONFIG_CFG_KEYS.items():
+            if k not in data:
+                continue
+            try:
+                v = max(0, int(data[k]))
+            except (TypeError, ValueError):
+                continue
+            sect = self.cfg.setdefault(sec, {})
+            old = sect.get(ck)
+            if old != v:
+                sect[ck] = v
+                self.overrides[k] = v
+                changed[k] = {"old": old, "new": v}
+        for k in CONFIG_LIST_KEYS:
+            if k in data and isinstance(data[k], list):
+                attr = CONFIG_LIST_ATTRS[k]
+                vals = [str(x).strip() for x in data[k] if str(x).strip()]
+                if getattr(self, attr, None) != vals:
+                    changed[k] = {"old": getattr(self, attr, None), "new": vals}
+                    setattr(self, attr, vals)
+                    self.overrides[k] = vals
+        if changed and persist:
+            self._save_state()
+            self.log("参数热更新: %s" % json.dumps(changed, ensure_ascii=False)[:200])
+        return changed
+
+    def config_get(self):
+        out = {}
+        for k in CONFIG_KEYS:
+            attr = CONFIG_KEY_ATTRS.get(k, k)
+            out[k] = getattr(self, attr, None)
+        for k, (sec, ck) in CONFIG_CFG_KEYS.items():
+            out[k] = (self.cfg.get(sec) or {}).get(ck)
+        for k in CONFIG_LIST_KEYS:
+            out[k] = list(getattr(self, CONFIG_LIST_ATTRS[k], []) or [])
+        return out
+
+    # ---------- 行为流（观察思考/工具调用） ----------
+    def _latest_behavior_log(self):
+        try:
+            files = glob.glob(os.path.join(config_loader.AGENT_ROOT, "logs",
+                                           "behavior_*.jsonl"))
+            if not files:
+                return None
+            return max(files, key=os.path.getmtime)
+        except OSError:
+            return None
+
+    def feed(self, n=60):
+        """最近的行为事件（思考/工具调用/审查/停止），来自最新 behavior 日志。"""
+        _KEEP = ("llm_response", "tool_call", "force_stopped", "review_force_stop",
+                 "review_pass", "cost_guard_triggered", "auto_continue",
+                 "task_start", "task_end", "chat_inject")
+        path = self._latest_behavior_log()
+        if not path:
+            return {"events": [], "source": None}
+        events = []
+        min_bt = None   # 当前运行起始时刻（用于把审查记录限定在本轮，避免跨运行累积重复）
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()[-300:]
+        except OSError:
+            return {"events": [], "source": os.path.basename(path)}
+        for line in lines:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            ev = rec.get("event")
+            if ev not in _KEEP:
+                continue
+            item = {"ts": rec.get("ts"), "rel_s": rec.get("rel_s"), "event": ev,
+                    "round": rec.get("round_no")}
+            if ev == "llm_response":
+                item.update({"kind": "思考", "text": rec.get("content_head") or "",
+                             "reasoning": rec.get("reasoning_head") or "",
+                             "tokens": rec.get("tokens"),
+                             "tools_n": rec.get("tool_call_n"),
+                             "elapsed": rec.get("elapsed")})
+            elif ev == "tool_call":
+                item.update({"kind": "工具", "text": "%s %s" % (rec.get("tool") or "",
+                                                               rec.get("args_head") or ""),
+                             "result": rec.get("result_head") or "",
+                             "elapsed": rec.get("elapsed")})
+            elif ev in ("force_stopped", "review_force_stop", "cost_guard_triggered"):
+                item.update({"kind": "停止", "text": rec.get("reason")
+                             or rec.get("detail") or rec.get("source") or ""})
+            elif ev == "review_pass":
+                item.update({"kind": "审查", "text": "第%d轮审查通过（最近%d次操作/token=%d/生命=%s）"
+                             % (rec.get("round_no"), rec.get("ops") or 0,
+                                rec.get("tokens") or 0, rec.get("hp"))})
+            elif ev == "auto_continue":
+                item.update({"kind": "续跑", "text": rec.get("text_head") or ""})
+            elif ev == "chat_inject":
+                item.update({"kind": "聊天注入", "text": "+%d条" % (rec.get("n") or 0)})
+            else:
+                item.update({"kind": ev, "text": rec.get("task_head")
+                             or rec.get("final_head") or ""})
+            # 稳定 uid：同一日志行跨刷新不变（UI 折叠状态据此保持）
+            item["uid"] = "%s|%s|%s|%08x" % (
+                rec.get("ts") or "", rec.get("round_no") if rec.get("round_no") is not None else 0,
+                ev, zlib.crc32(str(item.get("text") or "")[:60].encode("utf-8")))
+            events.append(item)
+            bt = (rec.get("ts") or "")[:19]
+            if min_bt is None or bt < min_bt:
+                min_bt = bt
+        # ---- 合并审查记录（review_*.jsonl，独立于 behavior 日志，保证可见）----
+        try:
+            rev_files = glob.glob(os.path.join(config_loader.AGENT_ROOT, "logs",
+                                               "review_*.jsonl"))
+            if rev_files:
+                rev_path = max(rev_files, key=os.path.getmtime)
+                with open(rev_path, "r", encoding="utf-8") as f:
+                    for line in f.readlines()[-200:]:
+                        try:
+                            r = json.loads(line)
+                        except ValueError:
+                            continue
+                        # 只合并当前运行时间窗内的审查（review_*.jsonl 跨运行累积）
+                        if min_bt and (r.get("ts") or "")[:19] < min_bt:
+                            continue
+                        verdict = r.get("verdict")
+                        if verdict:
+                            item = {"kind": "停止", "event": "review_force_stop",
+                                    "ts": r.get("ts"), "round": r.get("round"),
+                                    "text": "审查强制停止: %s" % str(verdict)[:80]}
+                        else:
+                            item = {"kind": "审查", "event": "review_pass",
+                                    "ts": r.get("ts"), "round": r.get("round"),
+                                    "text": "第%d轮审查通过（生命=%s/token=%d）"
+                                            % (r.get("round"), r.get("hp"),
+                                               r.get("tokens") or 0)}
+                        item["uid"] = "%s|%s|%s|%08x" % (
+                            r.get("ts") or "", r.get("round") if r.get("round") is not None else 0,
+                            item["event"],
+                            zlib.crc32(str(item.get("text") or "")[:60].encode("utf-8")))
+                        events.append(item)
+        except OSError:
+            pass
+        # 按时间排序后取最近 n 条
+        events.sort(key=lambda e: e.get("ts") or "")
+        return {"events": events[-n:], "source": os.path.basename(path)}
+
+    # ---------- 控制API服务 ----------
+    def _start_control_server(self):
+        handler = type("BoundHandler", (_ControlHandler,), {"daemon": self})
+        try:
+            srv = ThreadingHTTPServer(("127.0.0.1", self.control_port), handler)
+        except OSError as e:
+            self.log("控制API启动失败(端口%d): %s（不影响主循环）" % (self.control_port, e))
+            return
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.log("控制API已启动: http://127.0.0.1:%d （/status /backlog /wake /stop）"
+                 % self.control_port)
+
+    # ---------- 主循环 ----------
+    def serve_forever(self):
+        self._start_control_server()
+        self.log("守护进程启动: bot=%s 轮询%.1fs 定时唤醒%.0fs 每%d轮审查 手动唤醒门控=需未运行"
+                 % ("/".join(self.bot_names), self.poll_interval, self.wake_interval,
+                    self.review_every))
+        if self.say_on_start:
+            self._say("[自动] 守护进程上线，@我提需求或等定时唤醒")
+        last_wake_check = time.time()
+        last_heartbeat = time.time()
+        try:
+            while not self._stop:
+                try:
+                    self.poll_chat()
+                except Exception as e:
+                    self.log("轮询异常: %s" % str(e)[:120])
+                now = time.time()
+                # 定时唤醒（到点检查积压）
+                if now - last_wake_check >= self.wake_interval:
+                    last_wake_check = now
+                    self._scheduled_wake()
+                # 提及唤醒 / 手动唤醒（门控：仅未运行+冷却过）
+                if self._wake_allowed():
+                    if self.wake_now.is_set():
+                        self.wake_now.clear()
+                        self.log("手动唤醒触发")
+                        self._trigger("manual")
+                    elif self._has_mention():
+                        self._trigger("mention")
+                # 心跳落盘（防状态文件长时间不更新）
+                if now - last_heartbeat >= 30:
+                    last_heartbeat = now
+                    self._save_state()
+                time.sleep(self.poll_interval)
+        except KeyboardInterrupt:
+            self.log("收到 Ctrl-C，准备退出")
+        finally:
+            self._stop = True
+            self._save_state()
+            self._say("[自动] 守护进程下线")
+            self.log("守护进程已退出")
+
+    def stop(self):
+        self._stop = True
+
+
+def run_daemon(cfg, verbose=True):
+    return Daemon(cfg, verbose=verbose).serve_forever()

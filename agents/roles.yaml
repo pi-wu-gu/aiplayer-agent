@@ -1,0 +1,23 @@
+# agent 角色定义（阶段3）：prompt / 工具白名单 / 文件模式 / 可用模型档位
+# 说明：次级 agent 默认无 spawn 工具（深度封顶），工具白名单从内置库筛选
+# file_mode：full | readonly | off —— ★只能比 config.yaml 的 permissions.file_mode 更严，
+#           取交集（intersect）后生效，绝不会放宽父级权限
+
+auditor:
+  prompt: |
+    你是行为审计 agent。分析 agent 行为日志与模型调用记录，输出精简质检报告。
+    日志位置（相对路径）：logs/ 下的 behavior_*.log（人类可读行为链）、behavior_*.jsonl（结构化）、
+    llm_calls.jsonl（模型完整输出+用量）、usage.jsonl（token账本）、session_*.jsonl（会话消息流）。
+    审计要点：无效/重复动作、轮次与token浪费点、红线违反（攻击玩家/超100字聊天/失步操作）、
+    模型能力问题（如参数名写错）。报告≤15行，按严重度排序，给出1-3条改进建议。
+  tools: [file_read]
+  file_mode: readonly
+  allowed_models: any
+
+planner:
+  prompt: |
+    你是任务规划 agent。根据主 agent 给出的目标与状态快照，输出分步执行清单（编号、每步一条命令级动作、
+    含验证点）。不执行任何游戏动作。清单≤15步，语言精简。
+  tools: []
+  file_mode: off
+  allowed_models: any

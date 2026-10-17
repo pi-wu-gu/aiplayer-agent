@@ -1,0 +1,110 @@
+# agent 全局配置（安全项见 keys.yaml）
+version: 1
+
+defaults:
+  provider: deepseek
+  model: deepseek-flash        # 用户指令(19:08)：之后模型全用 flash；框架已有 batch/auto_continue/别名/护栏兜底
+  temperature: 0.7
+  max_tokens: 4096            # 推理模型思考也占 token，不宜过小
+
+llm:
+  request_timeout: 60         # 秒
+  max_retries: 3              # 429/超时指数退避次数
+  usage_log: logs/usage.jsonl # 用量账本（数字）
+  call_log: logs/llm_calls.jsonl  # 模型输出完整记录（content/reasoning/tool_calls/usage，供分析）
+
+cost_guard:                   # 成本熔断（配合余量查询）
+  enabled: true
+  min_balance: 10.0           # 用户指令(15:58)：余额低于10元不得开始测试；运行中低于10元暂停
+  min_balance_stop: 5.0       # 低于此值→全停
+  session_token_budget: 200000  # 单 agent 会话 token 上限
+
+orchestrator:
+  max_depth: 2                # 主→次→禁止再建
+  max_concurrent_subagents: 4
+  default_subagent_timeout: 300   # 秒
+
+tool_maker:
+  sandbox_timeout: 10
+  allow_network: false        # 自研工具默认禁网（白名单在 tools/custom/manifest 内显式声明）
+  require_user_confirm_cross_session: true   # 落盘工具跨会话生效需人工确认
+
+context:                      # 上下文消耗优化（阶段2.5）
+  compress_threshold: 350     # 工具结果超过此字数→规则摘要+存档
+  prune_keep: 10              # 最近N条消息保留原文，更早的tool结果归档为占位符
+
+mc_bridge:
+  base_url: http://127.0.0.1:8780   # 模组 HTTP 控制面（旧 JsMacros 桥 8765 已废弃，协议兼容）
+  action_timeout: 20          # 发动作后等 last_action 的轮询上限
+  action_poll_interval: 1.0
+  allow_screenshot: false     # 截图动作总闸（★当前模型无视觉，截图对决策零收益，默认拦截；
+                              # 换视觉模型时改 true 解锁）
+
+permissions:                  # 权限表（与模组侧 aiplayer-common.toml 的 [permissions] 同名概念）
+  file_mode: full             # full | readonly | off —— 本侧只能"收窄"，不会放宽模组侧
+  roots:                      # 文件工具的白名单根（具名）；shared 即模组侧的运行数据目录
+    agent: "."                # 相对 AGENT_ROOT（. = PCL2/agent）
+    shared: "C:/Users/w0801/PCL2/AI/game/aiplayer"
+  default_root: agent         # 相对路径默认落在哪个根
+  # 说明：装配期生效 —— off 时 file_* 工具根本不注册；readonly 只注册 file_read。
+  #       角色的 file_mode（agents/roles.yaml）只能更严，不能更宽。
+
+  shell:                      # ★★ 高危可选项：允许 agent 执行**本机**命令行。默认关闭 ★★
+    enabled: false            # ★默认关闭；开启时启动会打印显著危险提示
+    mode: allowlist           # allowlist（推荐）| any（任意程序，最危险）
+    allowlist: []             # 裸程序名白名单（不含路径），如 ["python", "ffmpeg"]
+    workdir: "."              # 工作目录，相对 AGENT_ROOT（越界回退到 AGENT_ROOT）
+    timeout_sec: 30           # 单次超时（秒，上限 600）——超时强杀
+    max_output: 8000          # stdout/stderr 各自截断字符数
+    allow_from_chat: false    # ★由游戏聊天/@提及/定时积压触发时是否也允许调用。
+                              #   **保持 false**：聊天内容来自服务器上的其他玩家，属不可信输入，
+                              #   放行等于把"任何玩家 → 你电脑上的任意命令"这条路打开（提示词注入 → RCE）
+    audit_log: logs/shell_audit.log   # 每次调用的审计落盘（含 argv/rc/耗时/输出头部）
+    # 安全设计：无 shell（subprocess shell=False，管道/重定向/&& 不解释）；
+    #          白名单模式下 argv[0] 必须是裸程序名且经 shutil.which 解析；
+    #          工作目录限制 + 超时 + 输出截断 + 全程审计。
+
+  web:                        # 网页抓取工具 web_fetch（只读 GET，不进模组侧；对应模组无此能力）
+    enabled: true              # 总闸；false 时工具不注册
+    allow_from_chat: true      # 游戏聊天/@提及触发时是否允许。与 shell 的 False 不同：
+                               #   网页是只读抓取，最坏后果是被诱导读恶意内容，
+                               #   不构成对本机的直接控制，故默认放开（内容不可信性在
+                               #   工具描述与 PRIMARY_PROMPT 中均已声明）
+    timeout_sec: 15            # 单次抓取超时（秒，代码内封顶 60）
+    max_bytes: 2097152         # 响应体大小上限（2MB），超出即中断
+    max_chars: 6000            # 返回正文截断字符数（代码内封顶 20000）
+    cache_ttl: 600             # 同 URL 结果缓存秒数（0=关）。运行日志实证 agent 会把同一
+                              # 搜索页抓 4 遍（提示词管不住 LLM 的跨轮记忆），而网页正文
+                              # 常驻上下文——缓存兜底：期内重复请求直接复用并标记 cached=true
+    audit_log: logs/web_fetch.log   # 每次抓取的审计落盘（含 url/触发源/状态码/字数）
+    # 边界：仅 http/https；重定向上限 5 次；HTML 剥标签为纯文本；
+    #       网页正文在上下文压缩中走 _NO_ARCHIVE 白名单（不毁正文）。
+
+daemon:                       # 持续运行模式（python run.py --daemon）
+  bot_names: ["muyiyangDeepseek"]   # 被哪些名字@提及时唤醒（自身发言不触发）
+  mention_extra: []           # 额外触发词（大小写不敏感），如 ["小深"]
+  allow_ai_wake_words: false  # ★可选项：允许 AI 自己增删额外唤醒词（存 config/wake_words.json，
+                              #   与上面 mention_extra 并列生效；daemon 轮询自动重载，加词即时生效）。
+                              #   默认关闭：开启后玩家可在聊天里让 AI 加词（上限 8 个、词长≤16、
+                              #   每次增删记录触发来源）——注意这会间接放开"玩家控制唤醒行为"，滥用可回收
+  ai_wake_words_max: 8        # AI 自管唤醒词数量上限
+  poll_interval: 2.0          # 聊天轮询间隔（秒）
+  wake_interval: 300          # 定时唤醒间隔（秒）：到点检查积压未读
+  wake_check_backlog: true    # 定时唤醒仅在“有积压”时才运行
+  review_every: 32            # 每运行N轮唤醒审查一次行为
+  review_token_budget: 60000  # ★按消耗量触发：自上次审查累计 token 超此值即提前审查（0=关闭）。
+                              #   轮数与消耗任一满足都会审；长调研任务靠它兜底（单轮烧 token 很快）
+  review_llm: false           # 审查是否额外调 LLM（默认纯规则，省token）
+  review_model: deepseek-flash
+  run_cooldown: 5             # 两次唤醒运行之间的最小间隔（秒）
+  max_rounds_per_run: 60      # 单次唤醒运行的轮数上限
+  control_port: 8770          # 控制API端口（/status /backlog /wake /stop）
+  initial_backlog: false      # 首启是否把历史聊天全算积压（默认跳过历史）
+  backlog_max: 200            # 积压上限（超出丢最旧）
+  say_on_start: true          # 启动时游戏内播报
+  state_path: logs/daemon_state.json
+
+logging:
+  level: INFO
+  dir: logs
+  redact_keys: true           # 日志中脱敏所有 api_key

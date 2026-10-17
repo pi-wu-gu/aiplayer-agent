@@ -1,0 +1,15 @@
+# ===== ★真实密钥——绝不入库（模板 keys.yaml.example 入库）=====
+config/keys.yaml
+
+# ===== 运行时产物 =====
+logs/
+__pycache__/
+*.pyc
+*.log
+
+# ===== 临时/杂项 =====
+234
+perm_test.txt
+*.tmp
+.DS_Store
+Thumbs.db

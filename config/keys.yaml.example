@@ -1,0 +1,35 @@
+# 密钥配置模板 —— 复制为 keys.yaml 后手动填写；keys.yaml 永不提交/进日志
+# 字段说明：
+#   name         : 自定义标识（config.defaults.provider 引用它）
+#   base_url     : OpenAI 兼容端点（不带 /chat/completions）
+#   api_key      : 密钥，或写 $ENV_VAR 名引用环境变量
+#   balance_api  : 余量查询协议 auto / one-api / deepseek / moonshot / siliconflow / none
+#   notes        : 备注（可选）
+
+providers:
+  - name: deepseek
+    base_url: https://api.deepseek.com
+    api_key: sk-xxxxxxxxxxxxxxxx
+    balance_api: deepseek
+    notes: 主力模型 deepseek-chat / deepseek-reasoner
+
+  - name: relay1              # one-api / new-api 类中转站示例
+    base_url: https://你的中转站域名/v1
+    api_key: sk-xxxxxxxxxxxxxxxx
+    balance_api: one-api
+    notes: 中转站，模型名以站点公告为准
+
+  # - name: moonshot
+  #   base_url: https://api.moonshot.cn/v1
+  #   api_key: sk-xxxx
+  #   balance_api: moonshot
+
+  # - name: siliconflow
+  #   base_url: https://api.siliconflow.cn/v1
+  #   api_key: sk-xxxx
+  #   balance_api: siliconflow
+
+# 模型标价表（元/百万tokens，供成本提示与熔断估算；可留空=不提示）
+model_prices:
+  deepseek-chat: { input: 2, output: 8 }
+  deepseek-reasoner: { input: 4, output: 16 }
