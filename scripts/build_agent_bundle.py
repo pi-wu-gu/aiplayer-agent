@@ -146,7 +146,8 @@ def smoke_test(bundle):
         code = ("import sys; sys.path.insert(0, r'%s');"
                 "import requests, yaml;"
                 "from core import config_loader, orchestrator, runner, daemon;"
-                "from tools.builtin import mc_bridge, file_io, shell_exec, wake_words, web_fetch;"
+                "from tools.builtin import mc_bridge, file_io, shell_exec, wake_words, web_fetch,"
+                " keyword_memory, todo_list;"
                 "print('IMPORTS-OK', sys.version.split()[0])" % root)
         r = subprocess.run([py, "-c", code], env=dict(os.environ), cwd=root,
                            capture_output=True, text=True, timeout=120, errors="replace")

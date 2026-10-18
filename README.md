@@ -33,16 +33,16 @@ Windows 快捷方式：`scripts/启动agent.bat` / `scripts/停止agent.bat`。
 > （`<gamedir>/aiplayer-agent/<mod_version>/`），把改动的文件复制进该目录 →
 > 杀 `run.py --daemon` 进程 → 手动拉起即可。bundle 变了才需要升 `mod_version`。
 
-## 工具面（17 静态 + 5 动态 + 2 按开关）
+## 工具面（19 静态 + 6 动态 + 2 按开关）
 
 | 组 | 工具 |
 |---|---|
 | 游戏桥接 | `mc_state` `mc_act` `mc_batch` `mc_chat` |
 | 文件（框架侧，★首选） | `file_read` `file_write` `file_list` `file_stat` `file_grep` `file_mkdir` `file_copy` `file_move` `file_delete` `file_restore` |
 | 网络 / 成本 | `web_fetch` `balance_query` |
-| 自管 | `wake_blacklist` |
-| 动态（`run_task` 内） | `memory` `finish_run` `session_stats` `tool_result` `spawn_subagent` |
-| 按开关关闭 | `shell_run`（`permissions.shell.enabled=false`）、`wake_words`（`daemon.allow_ai_wake_words=false`） |
+| 自管 | `wake_blacklist` `keyword_memory` `todo_list` |
+| 动态（`run_task` 内） | `memory` `finish_run` `session_stats` `tool_result` `spawn_subagent` `spawn_parallel` |
+| 按开关关闭 | `shell_run`（`permissions.shell.enabled=false`）、`wake_words`（`daemon.allow_ai_wake_words=false`）、`keyword_memory`（`daemon.keyword_memory_enabled=false`）、`todo_list`（`daemon.todo_list_enabled=false`） |
 
 逐项说明见游戏目录 `aiplayer/docs/框架工具.md`。
 
@@ -76,6 +76,10 @@ agent 触发高危/越界动作 → 落待审核申请（绑定 工具+参数指
 - 参数指纹前会**归一路径**（`\`↔`/`、`//` 压缩、Windows 忽略大小写）
 - 审计落 `logs/approval_audit.log`
 - 越界路径不再硬拒，改走同一套申请（`file_io.safe_path_gated()`）
+- ★接入面扩容（2026-10-18 P0/P1）：`file_copy`/`file_move` 越界（critical）、`mc_act command`（critical）、
+  `mc_act connect`/`agent_stop`（medium）、`shell_exec` 越白名单（critical）
+- ★审批记录带触发 agent 名（`run_context.agent_name`，primary/sub_xxx）；两级链申请带
+  `chain: sub→primary→operator`；被拒申请重试会明确返回 `rejected_by`（不再刷重复申请）
 
 ### ★本机命令行 `permissions.shell`（默认关闭）
 
@@ -115,6 +119,41 @@ agent 触发高危/越界动作 → 落待审核申请（绑定 工具+参数指
 - ★**只有 day 层归档源材料**（unsorted 是中间态）；日/周/月档是成品明细，永远保留
 - 总结走 agent 自身上下文，**不额外开 LLM**
 
+## 关键词记忆（`tools/builtin/keyword_memory.py`，2026-10-19）
+
+把术语/约定/教训做成短条目存 `config/keywords.json`，**按关键词触发式注入**任务上下文——
+不占用每轮 prompt，只有任务文本里出现关键词时才把条目内容拼进任务头。
+
+| 面 | 行为 |
+|---|---|
+| 条目 | `{keyword, content, fill, player, hits}`；上限 30 条 / 单条 200 字（`daemon.keyword_memory_max_entries/max_content`） |
+| 三态 fill | `full`=注入全文；`keyword_only`=只注入关键词+提示 `action=lookup` 查全文（省上下文的搜索式激活）；`off`=完全不进候选 |
+| 注入上限 | 单次运行最多注入 `keyword_memory_max_inject`（默认 3）条；**达到即推控制台「⚠ 警告」区** |
+| 玩家专有 | `player` 字段绑定玩家名：该玩家在线时**无条件带上**（前缀【玩家X相关·在线】）；在线名单走 8780 本地队列+TTL 120s 缓存，查询失败自动降级为仅关键词命中 |
+| 同词追加 | 同关键词不允许重复定义，`add` 自动把新内容追加到旧条目（合并超限被拒） |
+| 风险审查 | `player_request_risk_review`（默认开）：mention/scheduled 任务注入【玩家请求风险审查】提示段 |
+| 审计 | 所有条目操作写 `logs/keyword_memory_audit.log`（agent 可读，含 trigger 来源） |
+
+agent 侧五个动作：`list` / `add` / `del` / `lookup`（无关键词=返回全部全文）/ `fill`（改三态）。
+
+## 待办清单（`tools/builtin/todo_list.py`，2026-10-19）
+
+跨唤醒常驻的任务清单：daemon **每轮唤醒**把当前未完成任务原样注入任务头
+（【待办清单】块，空清单也注入一行纪律提醒）——与关键词记忆的分工：那边按词触发
+记稳定知识，这边无条件注入记"没做完的事"。条目存 `config/todo.json`（AI 自管）。
+
+| 面 | 行为 |
+|---|---|
+| 登记 | 收到任务/要求 → `action=add task="…"`（≤200 字）；**同任务重复 add 不重复登记**（返回已有条目 id） |
+| 移除 | 完成 → `action=del id=…`（或 `task="原文"`，id 支持 `"3"`/`"#3"`）；id 自增不复用 |
+| 纪律 | PRIMARY_PROMPT 常驻：**finish_run 之前清单应为空**（做不完的留下并在最终汇报说明原因） |
+| 上限 | `daemon.todo_list_max`（默认 20）条；超限 add 被拒（先 del 再加，或合并相近任务） |
+| 注入 | 每轮唤醒无条件注入（含 scheduled 空跑）；开关 `daemon.todo_list_enabled`（热改） |
+| 风险审查 | 同关键词记忆：玩家来源的增删请求先审风险（`player_request_risk_review`） |
+| 审计 | 所有操作写 `logs/todo_audit.log`（agent 可读，含 trigger 来源） |
+
+agent 侧三个动作：`list` / `add` / `del`。`/status` 回显 `todo_n`（当前条数）。
+
 ## 持续运行模式（daemon）
 ```
 python run.py --daemon
@@ -135,7 +174,7 @@ python run.py --daemon
 控制 API（默认 127.0.0.1:8770）：
 ```
 GET  /             # Web UI 面板（状态/参数/实时行为流/授权申请，浏览器直接开）
-GET  /status       # idle/running、积压数、待处理提及、统计
+GET  /status       # idle/running、积压数、待处理提及、待办数、统计
 GET  /backlog      # 最近50条积压（带 noise 标记）
 GET  /feed?n=80    # 实时行为流：思考/工具调用/审查/停止（读最新 behavior 日志）
 GET  /config       # 读取全部运行参数（含实际生效值）
@@ -146,10 +185,12 @@ POST /instruct     # 从控制台下发一条临时任务（等同人工唤醒�
 GET  /approvals    # 待审核授权申请 + 审核历史
 POST /approvals/grant  # 批准（{id} 或 {"id":"*"} 全批）
 POST /approvals/deny   # 拒绝
+GET  /warnings     # 警告队列（如"关键词记忆激活达上限"）
+POST /warnings/clear   # 清空警告队列
 ```
 
 UI 面板：左列运行参数热改；中栏实时行为流（**工具调用与深度思考默认折叠、输出默认展开**，
-点击可展开且状态跨刷新保持）；右列状态/积压/🛡 授权申请（含审核历史）。
+点击可展开且状态跨刷新保持）；右列状态/积压/🛡 授权申请（含审核历史）/⚠ 警告（注入超限等）。
 
 日志：`logs/daemon.log`（过程）、`logs/daemon_state.json`（状态）、
 `logs/behavior_*.log`（每轮行为流水）、`logs/session_*.jsonl`（会话全文）、
@@ -169,6 +210,8 @@ UI 面板：左列运行参数热改；中栏实时行为流（**工具调用与
 | `tests/test_review_context.py` | LLM 审查提示词必须带任务上下文 | 12 |
 | `tests/test_permissions.py` | 权限表装配（file_mode / 角色收窄） | 15 |
 | `tests/test_shell_exec.py` | shell_run 四道闸 | 21 |
+| `tests/test_keyword_memory.py` | 关键词记忆工具五动作/触发注入三态/上限警告/玩家条目/风险审查 | 30 |
+| `tests/test_todo_list.py` | 待办清单增删去重/每轮注入/空清单纪律行/上限/mtime 重载/控制台热改 | 20 |
 | `tests/test_instance_lock.py` | 单实例锁 | — |
 
 ## 当前状态
@@ -176,8 +219,14 @@ UI 面板：左列运行参数热改；中栏实时行为流（**工具调用与
 - [x] 阶段 2：Agent 核心（tool loop）+ tool_registry（schema 校验）+ 内置工具
 - [x] 阶段 2.5 上下文优化：结果压缩+存档（`core/context.py`）+ 历史归档 + `tool_result` 取回
 - [x] 阶段 3：多 agent 协同（`spawn_subagent` + roles.yaml + 深度/并发限制）
+- [x] 子 agent 权限矩阵 + 并行池（2026-10-18）：次级固定受限身份——游戏获取类放行、
+  控制类需 `allowed_actions` 预授权（command/connect/agent_stop 不可预授权，自动升级操作者审批）；
+  `spawn_parallel` 并发只读角色（parallel_safe 白名单，游戏动作永远主 agent 串行）；
+  spawn 可指定 `name`（小写字母/下划线）
 - [x] 持续运行模式（daemon）：五机制齐备，控制台可观测可干预
 - [x] 工程加固（2026-10-18）：分层记忆 / 通用授权审批 / 完整文件能力 / 主动收工 / 噪声与黑名单过滤
+- [x] 关键词记忆触发式激活（2026-10-19）：条目三态填充 + 注入上限警告 + 玩家专有条目 + 请求风险审查
+- [x] 待办清单每轮唤醒注入（2026-10-19）：add/del 自管 + 同任务去重 + finish_run 前应为空纪律 + 空清单也注入
 - [ ] 阶段 4-5 见《docs/开发流程.md》第三节
 
 ## 已验证事实（滚动更新）

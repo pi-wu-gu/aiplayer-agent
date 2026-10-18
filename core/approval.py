@@ -178,7 +178,7 @@ def check(cfg, tool, args):
 
 
 def require(cfg, tool, args, reason="", risk="high", trigger=None,
-            how_to="", ttl=None):
+            how_to="", ttl=None, chain=None):
     """拦截并登记一条待审核申请。返回给 agent 的提示 dict。
 
     调用方约定：先 `check()` 通过才执行；否则调 `require()` 并把返回值交给 agent。
@@ -192,7 +192,12 @@ def require(cfg, tool, args, reason="", risk="high", trigger=None,
     key = _args_key(tool, args)
     with _LOCK:
         d = _load()
-        # 同一 (工具+参数) 已在等待？不重复排队，直接复用
+        # 同一 (工具+参数) 已被拒 → 明确告知拒绝方，别让 agent 盲目重试刷重复申请
+        for r in d["requests"]:
+            if (r.get("status") == "denied" and r.get("tool") == tool
+                    and r.get("args_key") == key):
+                return _denied_reply(r)
+        # 已在等待？不重复排队，直接复用
         for r in d["requests"]:
             if (r.get("status") == "pending" and r.get("tool") == tool
                     and r.get("args_key") == key):
@@ -204,8 +209,10 @@ def require(cfg, tool, args, reason="", risk="high", trigger=None,
                "args": _safe_args(args),
                "args_key": key,
                "trigger": trig,
+               "agent": run_context.agent_name(),
                "risk": risk,
                "reason": (reason or "")[:200],
+               "chain": (chain or "")[:80],
                "status": "pending"}
         d["requests"].append(req)
         # 队列长度控制
@@ -239,10 +246,32 @@ def _pending_reply(req, how_to, near=None):
     return {"ok": False, "blocked": True, "need_approval": True,
             "request_id": req["id"],
             "tool": req["tool"], "risk": req["risk"],
+            "agent": req.get("agent"),
             "reason": req["reason"],
             "message": msg,
             "nearby_granted": near.get("id") if near else None,
             "hint": "控制台 http://127.0.0.1:%d → 授权申请" % _port()}
+
+
+def _denied_reply(req):
+    """★同 (工具+参数) 已被拒 → 明确告知 agent 拒绝方（2026-10-18 批次1）。
+
+    此前 denied 申请在 require 的复用循环里被无视 → agent 重试会新建重复申请、
+    拒绝信息从不流回 agent。现在显式返回，让 agent 换方案（换参数=新申请）。"""
+    by = req.get("resolved_by") or "console"
+    who = {"console": "操作者（控制台）",
+           "system:expire": "系统（申请过期自动清理）",
+           }.get(by, by if by.startswith("primary:") else "操作者")
+    if by.startswith("primary:"):
+        who = "主 agent（%s）" % by.split(":", 1)[1]
+    return {"ok": False, "blocked": True, "need_approval": False,
+            "rejected": True, "rejected_by": by,
+            "request_id": req["id"], "tool": req["tool"], "risk": req.get("risk"),
+            "agent": req.get("agent"),
+            "reason": req.get("reason"),
+            "message": ("★该操作此前已被**%s**拒绝（申请 %s，%s）。不要用相同参数重试——"
+                        "要么换方案，要么修改参数后重新申请（新参数=新申请），"
+                        "或在汇报中说明此路不通。" % (who, req["id"], req.get("resolved_at") or ""))}
 
 
 def _port():
@@ -337,6 +366,8 @@ def expire_stale(cfg):
                 for r in d["requests"]:
                     if r.get("id") == g.get("id") and r.get("status") == "granted":
                         r["status"] = "expired"
+                        r["resolved_by"] = "system:expire"
+                        r["resolved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         if changed:
             _save(d)
 

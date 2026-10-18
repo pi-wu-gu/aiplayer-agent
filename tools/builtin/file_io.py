@@ -116,6 +116,40 @@ def _inside(root, target):
     return target_n.startswith(root_n.rstrip("\\/") + os.sep)
 
 
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def _walks_through_reparse(base, target):
+    """★reparse 点逃逸检测（2026-10-18，test_permissions 实测暴露）：
+    Windows 无特权环境下 os.symlink 对目录会**退化为 junction**（mount point）——
+    此时 os.path.islink() 返回 False、os.path.realpath() **也不解析**，
+    realpath 白名单防线被整体绕过（safe_path 把 ws/escape/secret.txt 当成根内路径放行）。
+    逐级 lstat 检查 FILE_ATTRIBUTE_REPARSE_POINT 补上这条缝；POSIX 上 realpath
+    已解开符号链接，这里 islink 兜底（正常应恒为 False）。"""
+    try:
+        rel = os.path.relpath(target, base)
+    except ValueError:
+        return True
+    if rel == os.curdir:
+        return False
+    cur = base
+    for part in rel.split(os.sep):
+        if part in (os.curdir, ""):
+            continue
+        if part == os.pardir:
+            return True   # target 不应在 base 之外还带 ..（_inside 已保证，双保险）
+        cur = os.path.join(cur, part)
+        try:
+            st = os.lstat(cur)
+        except OSError:
+            return False  # 中间组件不存在：无链接可解析，按现状放行
+        if getattr(st, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT:
+            return True
+        if os.path.islink(cur):
+            return True
+    return False
+
+
 def _split_root_prefix(raw, roots):
     """解析 `root:相对路径` 写法（如 `shared:docs/记忆`）。返回 (根名, 相对路径) 或 None。
 
@@ -144,6 +178,8 @@ def safe_path(cfg, path):
     candidate = os.path.realpath(raw if os.path.isabs(raw) else os.path.join(roots[default], raw))
     for root in roots.values():
         if _inside(root, candidate):
+            if _walks_through_reparse(root, candidate):
+                raise ValueError("路径经过符号链接/junction（reparse 点），拒绝：%r" % raw)
             return candidate
     raise ValueError("路径越界：只允许以下工作区之内 %s（收到 %r）"
                      % (sorted(roots.items()), raw))

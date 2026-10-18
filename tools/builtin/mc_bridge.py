@@ -306,7 +306,32 @@ GUIDE_SECTIONS = {
 }
 
 
-def make_mc_tools(cfg):
+def make_mc_tools(cfg, policy=None):
+    # ★子 agent 权限矩阵（2026-10-18 批次2）：获取类放行、控制类拦截（v1=拒绝转报告）。
+    # 分类白名单=**获取类**；不在表内的一律按控制处理（fail-closed，防模组新增动作漂移）。
+    # look_lock 特例：不带参数=查状态（获取）；带 target/x/y/face/aim=锁定（控制）。
+    _GET_ACTIONS = {
+        "state", "ping", "time", "actions", "actionslist", "list_actions", "tools", "docs",
+        "block_at", "blockstate", "scan_region", "find_block", "search_block", "nearest_block",
+        "be_nbt", "nbt_read", "block_entity_nbt", "item_nbt", "held_nbt", "item_components",
+        "get_inventory", "inv_query", "players", "entities",
+        "online_players", "online", "player_list", "tab_list",
+        "get_screen", "screen", "get_container", "container", "cont_info",
+        "dig_status", "dig_state", "place_status", "place_state",
+        "sign_read", "sign_text", "overlay", "actionbar",
+        "mc_chat", "chat", "screenshot", "shot", "f2",
+        "agent_status", "llm_chat", "llm", "llm_ping",
+        "file_read", "file_list",  # 模组侧（已弃用但保留）——只读放行
+        "reload_chunks",           # 仅影响本机渲染，无世界写
+    }
+
+    def _is_control(t, act):
+        if t == "look_lock":
+            # 无任何定位参数 = 查询锁定状态
+            return any(act.get(k) is not None
+                       for k in ("target", "target_type", "x", "y", "z", "face", "aim"))
+        return t.lower() not in _GET_ACTIONS
+
     def _state(fields=None):
         if not game_online(cfg)[0]:
             return _offline_result()
@@ -318,6 +343,23 @@ def make_mc_tools(cfg):
             return _offline_result()
         action = dict(kwargs)
         action["type"] = type
+        # ★权限矩阵（批次2+3）：受限身份（子 agent）碰控制类动作：
+        #   命中主 agent 预授权清单（allowed）→ 放行并计数（reviewer=primary）
+        #   未命中 → 拒绝转报告
+        #   ★例外：command/connect/agent_stop 即使预授权命中也不放行——它们属操作者
+        #   审批类，落到下方审批闸自动升级进控制台待审批表（两级链，chain 标注）。
+        _OPERATOR_ONLY = ("command", "connect", "agent_stop")
+        if policy and policy.get("mode") == "restricted" and _is_control(type, action):
+            allowed = policy.get("allowed") or {}
+            entry = allowed.get(str(type).lower())
+            if entry and entry.get("used", 0) < entry.get("max", 0) and type not in _OPERATOR_ONLY:
+                entry["used"] = entry.get("used", 0) + 1
+            elif type not in _OPERATOR_ONLY:
+                return {"sent": False, "blocked": True, "policy": "sub_restricted",
+                        "caller": policy.get("caller"),
+                        "error": "控制类动作 %s 不在主 agent 的预授权清单内（或次数已用尽），已拦截。"
+                                 "请改用只读动作完成侦察，并把【想做的动作+目标+原因】写进你的报告，"
+                                 "由主 agent 审阅后决定是否代为执行或重新授权。" % type}
         # 参数别名容错：LLM 常把 say 的 text 写成 msg/message，或传成 null
         if type == "say" and not action.get("text"):
             for alt in ("msg", "message", "content"):
@@ -369,6 +411,32 @@ def make_mc_tools(cfg):
                     "error": "screenshot 已被框架拦截：当前模型无视觉能力，看不到截图内容，"
                              "对决策零收益。要看界面内容用 mc_act type=\"get_screen\"；"
                              "换视觉模型后可在 config.yaml 设 mc_bridge.allow_screenshot=true 解锁。"}
+        # ★高危游戏动作审批（2026-10-18 P0/P1 纳入授权体系）：
+        #   command=发服务器命令（等价服务器内 RCE：/op 自己、/stop 服务器等）→ critical
+        #   connect=立即重连别的服务器（断开当前会话）→ medium
+        #   agent_stop=停掉 sidecar daemon 进程（自杀性）→ medium
+        # 指纹=完整 action dict（别名容错已完成，text 已归一）——重试必须同参数。
+        if type in ("command", "connect", "agent_stop"):
+            _risk = {"command": "critical", "connect": "medium", "agent_stop": "medium"}[type]
+            from core import approval as _appr
+            aargs = {k: v for k, v in action.items() if v is not None}
+            if not _appr.check(cfg, "mc_act", aargs):
+                if not _appr.enabled(cfg):
+                    return {"sent": False,
+                            "error": "动作 %s 属高危类，审批体系已关闭（permissions.approval.enabled=false）→ 直接拒绝" % type}
+                # ★两级审批链（批次3）：来自受限子 agent 的申请标注 chain，
+                # 操作者在控制台能看到"主 agent 已预授权、只差操作者终审"
+                _chain = None
+                if policy and policy.get("mode") == "restricted":
+                    _chain = "sub(%s)→primary(预授权)→operator" % policy.get("caller")
+                return _appr.require(
+                    cfg, "mc_act", aargs,
+                    reason="执行%s动作 %s%s" % (
+                        {"command": "服务器命令", "connect": "重连", "agent_stop": "进程停止"}[type],
+                        type, (": " + str(action.get("text") or action.get("address") or ""))[:60]),
+                    risk=_risk,
+                    chain=_chain,
+                    how_to="控制台「🛡 授权申请」批准后，用**完全相同的参数**再调一次 mc_act 即执行。")
         # ★容器槽位分区护栏（2026-10-16 混淆事故）：click_slot 用菜单全局索引，
         # 普通容器=容器区在前、背包区在后（分界随容器大小变）。点在自己背包区上
         # = 动自己的东西（quick=true 快移会把它送进容器）——查一次分区并明确警告。

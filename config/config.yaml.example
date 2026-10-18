@@ -23,6 +23,7 @@ cost_guard:                   # 成本熔断（配合余量查询）
 orchestrator:
   max_depth: 2                # 主→次→禁止再建
   max_concurrent_subagents: 4
+  max_parallel: 2             # ★spawn_parallel 单次并行任务数上限（批次4；≤3 防 LLM 429 连锁）
   default_subagent_timeout: 300   # 秒
 
 tool_maker:
@@ -105,6 +106,22 @@ daemon:                       # 持续运行模式（python run.py --daemon）
                                   #   三条硬红线（代码强制）：不得屏蔽 bot 自己的名字 / 不得屏蔽
                                   #   mention_extra / 拒绝 `.*` 通杀正则。默认开（噪声过滤收益大于风险）
   wake_blacklist_max: 20      # 黑名单条数上限
+  # ★关键词记忆（2026-10-19，触发式激活）：术语/约定/教训做成短条目存 config/keywords.json，
+  #   任务文本/积压聊天命中关键词时自动注入任务头（一次运行每词一次）。与分层记忆互补。
+  keyword_memory_enabled: true       # 总闸；false=工具不注册+不注入（已存条目保留在文件里）
+  keyword_memory_max_entries: 30     # 条目上限（超出需先 del）
+  keyword_memory_max_content: 200    # 单条内容字数上限（同词追加后超限会被拒）
+  keyword_memory_max_inject: 3       # 单次运行注入条数上限——达到即触发控制台「⚠ 警告」展示区
+  keyword_memory_min_len: 2          # 关键词最短字数（挡单字误命中）
+  keyword_memory_players_ttl: 120    # 玩家在线名单缓存秒数（服务器线路延迟高时放大窗口；
+                                     #   查询失败自动降级为"仅按关键词命中"，不阻塞唤醒）
+  # ★待办清单（2026-10-19，每轮唤醒无条件注入）：agent 收到任务即登记、完成即移除，
+  #   存 config/todo.json（AI 自管，不动本文件）；daemon 唤醒时按 mtime 重载。
+  #   与关键词记忆的分工：那边按词触发记稳定知识，这边无条件注入记"没做完的事"。
+  todo_list_enabled: true            # 总闸；false=工具不注册+不注入（已存条目保留在文件里）
+  todo_list_max: 20                  # 条目上限（超出 add 被拒，需先 del）
+  player_request_risk_review: true   # ★玩家请求（含加/改/删关键词记忆条目、增删待办）先审风险再执行：
+                                     #   mention/scheduled 任务注入审查提示 + PRIMARY_PROMPT 常驻纪律
   poll_interval: 2.0          # 聊天轮询间隔（秒）
   wake_interval: 300          # 定时唤醒间隔（秒）：到点检查积压未读
   wake_check_backlog: true    # 定时唤醒仅在“有积压”时才运行
@@ -124,6 +141,11 @@ daemon:                       # 持续运行模式（python run.py --daemon）
   review_llm: true            # 审查是否额外调 LLM。★默认开：纯规则的 R1/R2 只能查工具失败，
                               #   而"空转"（工具全成功、反复查同一件事）规则查不出来——
               #   2026-10-18 实测 22 条审查记录 verdict 全 null 就是这个原因
+  review_help_on_no_progress: true  # ★无效进展→游戏内求助并停止（2026-10-18 用户指令，默认开）。
+                              #   LLM 审查新增第 5 判据："每轮动作都不同但整体打转"（GUI 容器试错循环、
+                              #   长时间寻物无果）——重复检测抓不到，只有 LLM 能判断。触发时 daemon
+                              #   代发一条【求助】say 说明卡点，然后强制停止，等操作者指路。
+                              #   控制台参数面板可实时开关（review_help_on_no_progress）。
   review_model: deepseek-flash
   run_cooldown: 5             # 两次唤醒运行之间的最小间隔（秒）
   max_rounds_per_run: 60      # 单次唤醒运行的轮数上限

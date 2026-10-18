@@ -97,8 +97,14 @@ class SafePathTest(unittest.TestCase):
         self.cfg = make_cfg("full", {"agent": self.ws})
         self.link_ok = False
         try:
-            os.symlink(self.outside, os.path.join(self.ws, "escape"))
-            self.link_ok = True
+            link = os.path.join(self.ws, "escape")
+            os.symlink(self.outside, link)
+            # ★防沙盒伪影（2026-10-18）：沙盒虚拟 FS 下 os.symlink 可能"假成功"
+            # （不抛异常但什么都没创建）。只有链接真的存在且是 link/junction
+            # 才算 link_ok，否则 skipTest。
+            st = os.lstat(link)
+            self.link_ok = bool(os.path.islink(link)
+                                or (getattr(st, "st_file_attributes", 0) & 0x400))
         except (OSError, NotImplementedError, AttributeError):
             self.link_ok = False
 

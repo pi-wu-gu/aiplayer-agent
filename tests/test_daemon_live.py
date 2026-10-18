@@ -83,11 +83,14 @@ def main():
     # ★2026-10-18 修正：@提及必须由**别人**发出（<PlayerB>），不能写成 <ExampleBot>——
     #   后者会被 is_mention 判为"bot 自己的发言"而排除（防自激），导致 runs 为空。
     #   这正是新规则"无发言人/自己发言不算提及"该有的行为，测试数据要跟真实场景一致。
+    # ★2026-10-19 修正：假条目 ID 必须**动态高于已种子化的真实游标**——曾硬编码 9001-9004，
+    #   真实聊天涨到 9013 后全被 `id > since` 过滤，测试假失败（与代码无关）。
+    base_id = max(9000, int(getattr(d, "cursor", 0) or 0))
     fake_entries = [
-        {"id": 9001, "t": time.time(), "text": "[world] <PlayerB>: @ExampleBot 看看经验块"},
-        {"id": 9002, "t": time.time(), "text": "[world] <PlayerB>: 今天天气不错"},
-        {"id": 9003, "t": time.time(), "text": "[world] <ExampleBot>: [自动] 测试开始: 自己的发言"},
-        {"id": 9004, "t": time.time(), "text": "ExampleBot is now sleeping. [1/3]"},
+        {"id": base_id + 1, "t": time.time(), "text": "[world] <PlayerB>: @ExampleBot 看看经验块"},
+        {"id": base_id + 2, "t": time.time(), "text": "[world] <PlayerB>: 今天天气不错"},
+        {"id": base_id + 3, "t": time.time(), "text": "[world] <ExampleBot>: [自动] 测试开始: 自己的发言"},
+        {"id": base_id + 4, "t": time.time(), "text": "ExampleBot is now sleeping. [1/3]"},
     ]
     real_fetch = d._fetch_chat
     fed = {"done": False}

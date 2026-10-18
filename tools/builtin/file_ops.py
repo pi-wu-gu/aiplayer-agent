@@ -136,9 +136,51 @@ def _stat(cfg, path):
     return {"ok": True, **info}
 
 
+def _gated_paths(cfg, tool, args, paths, risk="high"):
+    """★多路径越界审批（2026-10-18 P0：copy/move 纳入授权体系）。
+
+    src/dst **任一**越界 → 走授权申请（此前是裸 safe_path 硬拒，而 delete 越界
+    早就能申请——同类不同命）。红线沿用 file_delete 的两条教训：
+    ①令牌消费（approval.check）必须在越界分支内做，批准后重试才放行；
+    ②指纹必须用**完整 args**（含 overwrite），否则批了 A 执行 B。
+    越界放行后敏感文件拦截/保护清单检查照常生效。
+
+    返回 (reals, None) 或 (None, 提示 dict)。
+    """
+    reals, blocked, raw_blocked = [], None, None
+    for p in paths:
+        try:
+            reals.append(file_io.safe_path(cfg, p))
+        except ValueError as e:
+            blocked = str(e)
+            raw_blocked = str(p or "")
+            reals.append(None)
+            break
+    if blocked is None:
+        return reals, None
+    if approval.check(cfg, tool, args):
+        # 已批准 → 越界路径放行（解析基准与 safe_path 一致：相对路径拼 default_root 再 realpath；
+        # ★不能对全部路径统一 realpath——根内相对路径会被解析到 cwd，实测踩过"源不存在"）
+        roots = file_io.resolve_roots(cfg)
+        base = roots.get(file_io.default_root_name(cfg), config_loader.AGENT_ROOT)
+        reals[-1] = os.path.realpath(
+            raw_blocked if os.path.isabs(raw_blocked) else os.path.join(base, raw_blocked))
+        return reals, None
+    if not approval.enabled(cfg):
+        return None, {"ok": False, "blocked": True,
+                      "reason": "路径越界且审批体系已关闭（permissions.approval.enabled=false）：" + blocked}
+    return None, approval.require(cfg, tool, args,
+                                  reason="路径越界，申请临时放行: " + blocked[:140],
+                                  risk=risk,
+                                  how_to="控制台批准后，用**完全相同的参数**再调一次即执行。")
+
+
 def _copy(cfg, src, dst, overwrite=False):
-    s = file_io.safe_path(cfg, src)
-    d = file_io.safe_path(cfg, dst)
+    args = {"src": src, "dst": dst, "overwrite": bool(overwrite)}
+    reals, gate = _gated_paths(cfg, "file_copy", args, [src, dst], risk="critical")
+    if gate:
+        return gate
+    s, d = reals
     # ★敏感文件双向拦：复制源=外泄（复制成普通文件再读），复制目标=覆盖密钥/审批状态
     if file_io.is_sensitive(s) or file_io.is_sensitive(d):
         return file_io.sensitive_block(s if file_io.is_sensitive(s) else d)
@@ -155,8 +197,12 @@ def _copy(cfg, src, dst, overwrite=False):
 
 
 def _move(cfg, src, dst, overwrite=False):
-    s = file_io.safe_path(cfg, src)
-    d = file_io.safe_path(cfg, dst)
+    # ★越界=删除+越界写（原路径没了），与 delete 同级风险 → critical（2026-10-18 P0）
+    args = {"src": src, "dst": dst, "overwrite": bool(overwrite)}
+    reals, gate = _gated_paths(cfg, "file_move", args, [src, dst], risk="critical")
+    if gate:
+        return gate
+    s, d = reals
     if not os.path.exists(s):
         return {"ok": False, "reason": "源不存在: %s" % src}
     if _is_protected(cfg, s):

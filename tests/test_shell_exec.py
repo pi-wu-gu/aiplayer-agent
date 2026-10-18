@@ -142,11 +142,21 @@ class ShellAllowlistTest(unittest.TestCase):
         self.assertIn("裸程序名", r["reason"])
 
     def test_not_in_allowlist(self):
-        # 白名单里放别的程序，被调的是名单外的 → 命中"不在白名单"
+        # 白名单里放别的程序，被调的是名单外的 → ★2026-10-18 P1 起走授权申请
+        # （审批开启 → need_approval；申请里 reason 带"越白名单"字样）
         c = cfg_with({"enabled": True, "mode": "allowlist", "allowlist": ["some-other-program"]})
         r = shell_exec.execute(c, argv=["definitely-not-a-real-program"])
-        self.assertFalse(r["ok"])
-        self.assertIn("不在白名单", r["reason"])
+        self.assertTrue(r.get("need_approval"), r)
+        self.assertIn("越白名单", r.get("reason", ""))
+        # 审批关闭（显式 enabled=false）→ 退回硬拒，文案保留"不在白名单"
+        c2 = cfg_with({"enabled": True, "mode": "allowlist", "allowlist": ["some-other-program"],
+                       "approval_off": True})
+        c2 = dict(c2)
+        c2["permissions"] = dict(c2.get("permissions") or {})
+        c2["permissions"]["approval"] = {"enabled": False}
+        r2 = shell_exec.execute(c2, argv=["definitely-not-a-real-program"])
+        self.assertFalse(r2["ok"])
+        self.assertIn("不在白名单", r2["reason"])
 
     def test_allowlisted_but_missing(self):
         # 在名单里但 PATH 里不存在 → 命中 which 失败

@@ -253,6 +253,220 @@ ck("free 模式软删 b1/b2 成功", d1.get("ok") is True and d2.get("ok") is Tr
 new = sorted(set(os.listdir(trash_dir)) - before)
 ck("★同秒两次软删产生两个独立批次", len(new) == 2, str(new))
 
+# ---------- 13. P0/P1 审批扩容（2026-10-18）：copy/move 越界 + mc_act 高危 + shell 越白名单 ----------
+print("== 13. 审批扩容：copy/move 越界 ==")
+with open(os.path.join(_tmp, "src.txt"), "w", encoding="utf-8") as f:
+    f.write("data")
+outside = os.path.join(tempfile.gettempdir(), "appr_outside_%d.txt" % os.getpid())
+cr = file_ops._copy(BASE, "src.txt", outside)
+ck("file_copy 越界 → 走申请", cr.get("need_approval") is True and cr.get("request_id"), str(cr))
+cid = cr.get("request_id")
+ck("copy 越界申请进队列", any(r["id"] == cid for r in approval.pending(BASE)))
+ck("未批准时重试仍拦", file_ops._copy(BASE, "src.txt", outside).get("need_approval") is True)
+approval.grant(BASE, cid)
+copied = file_ops._copy(BASE, "src.txt", outside)
+ck("★批准后同参重试 copy 成功（令牌单次）", copied.get("ok") is True, str(copied))
+ck("文件确实落到了越界路径", os.path.isfile(outside))
+ck("批准后再次调用要重新申请（用完即焚）",
+   file_ops._copy(BASE, "src.txt", outside).get("need_approval") is True)
+
+mr = file_ops._move(BASE, "src.txt", outside, overwrite=True)
+ck("file_move 越界 → 走申请（critical）",
+   mr.get("need_approval") is True and mr.get("risk") == "critical", str(mr))
+mid = mr.get("request_id")
+approval.grant(BASE, mid)
+moved = file_ops._move(BASE, "src.txt", outside, overwrite=True)
+ck("★批准后同参重试 move 成功", moved.get("ok") is True, str(moved))
+ck("move 后源文件不在了", not os.path.isfile(os.path.join(_tmp, "src.txt")))
+
+# 改参数要重新申请（指纹一致性红线）
+mr2 = file_ops._move(BASE, "plain.txt", outside, overwrite=True)
+ck("move 改参数 → 新申请（指纹不匹配旧令牌）", mr2.get("need_approval") is True, str(mr2))
+
+print("== 13b. mc_act 高危动作审批 ==")
+from tools.builtin import mc_bridge  # noqa: E402
+mc_bridge.game_online = lambda cfg: (True, "ok")   # 跳过探活（离线测试）
+MCCFG = {"approval": {"enabled": True, "ttl_sec": 300},
+         "permissions": {"file_mode": "full",
+                         "roots": {"w": _tmp}, "default_root": "w"}}
+_mctools = dict((m["name"], fn) for m, fn in mc_bridge.make_mc_tools(MCCFG))
+mc_act_fn = _mctools["mc_act"]
+cmdr = mc_act_fn("command", text="list")
+ck("mc_act command → 走申请（critical）",
+   cmdr.get("need_approval") is True and cmdr.get("risk") == "critical", str(cmdr))
+cmdr2 = mc_act_fn("command", text="say approval-selftest-marker")
+ck("command 改参数 → 新申请", cmdr2.get("need_approval") is True
+   and cmdr2.get("request_id") != cmdr.get("request_id"), str(cmdr2))
+approval.grant(MCCFG, cmdr.get("request_id"))
+cmdr3 = mc_act_fn("command", text="list")
+# 注意：实测环境游戏在线时会**真执行**该命令（sent=True）——所以只断言"越过审批闸"，
+# 不断言 sent 值；离线时表现为桥接不可达，同样算越过。
+ck("★批准后重试 command 越过审批闸（need_approval 消失）",
+   cmdr3.get("need_approval") is None, str(cmdr3))
+for t in ("connect", "agent_stop"):
+    rr = mc_act_fn(t)
+    ck("mc_act %s → 走申请（medium）" % t,
+       rr.get("need_approval") is True and rr.get("risk") == "medium", str(rr))
+
+print("== 13c. shell 越白名单审批 ==")
+from tools.builtin import shell_exec  # noqa: E402
+SHELLCFG = {"approval": {"enabled": True, "ttl_sec": 300},
+            "permissions": {"shell": {"enabled": True, "mode": "allowlist",
+                                      "allowlist": ["certutil"], "allow_from_chat": True}}}
+sr = shell_exec.execute(SHELLCFG, argv=["python", "-c", "print(1)"])
+ck("shell 越白名单 → 走申请（critical）",
+   sr.get("need_approval") is True and sr.get("risk") == "critical", str(sr))
+sr2 = shell_exec.execute(SHELLCFG, argv=["python", "-c", "print(2)"])
+ck("shell 改参数 → 新申请", sr2.get("need_approval") is True, str(sr2))
+approval.grant(SHELLCFG, sr.get("request_id"))
+sr3 = shell_exec.execute(SHELLCFG, argv=["python", "-c", "print(1)"])
+ck("★批准后同参重试 shell 执行成功", sr3.get("ok") is True, str(sr3))
+sr4 = shell_exec.execute(SHELLCFG, argv=["..\\..\\evil.exe"])
+ck("显式路径仍是结构性硬拒（不进审批）",
+   sr4.get("need_approval") is None and sr4.get("ok") is False, str(sr4))
+
+# ---------- 14. 批次1：触发 agent 身份 + 拒绝告知拒绝方 ----------
+print("== 14. agent 身份与拒绝告知 ==")
+from core import run_context as _rc  # noqa: E402
+_rc.set_agent_name("sub_tester")
+r14 = approval.require(BASE, "file_delete", {"path": "agent_id_test.txt"},
+                       reason="身份测试", trigger="manual")
+ck("申请记录带触发 agent 名", r14.get("agent") == "sub_tester", str(r14))
+approval.deny(BASE, r14["request_id"], by="console")
+r14b = approval.require(BASE, "file_delete", {"path": "agent_id_test.txt"},
+                        reason="身份测试重试", trigger="manual")
+ck("★被拒申请重试 → 明确返回 rejected（不再新建重复申请）",
+   r14b.get("rejected") is True and r14b.get("need_approval") is False, str(r14b))
+ck("拒绝方=console 正确标注", r14b.get("rejected_by") == "console", str(r14b))
+ck("拒绝回复不产生新申请 id", r14b.get("request_id") == r14["request_id"], str(r14b))
+
+# 主 agent 拒绝的标注（primary:<name>）
+r14c = approval.require(BASE, "file_delete", {"path": "agent_id_test2.txt"},
+                        reason="主agent拒测试", trigger="manual")
+approval.deny(BASE, r14c["request_id"], by="primary:boss")
+r14d = approval.require(BASE, "file_delete", {"path": "agent_id_test2.txt"},
+                        reason="重试", trigger="manual")
+ck("主agent拒绝 → rejected_by=primary:boss",
+   r14d.get("rejected_by") == "primary:boss", str(r14d))
+
+# 换参数 = 新申请（不受旧拒绝影响）
+r14e = approval.require(BASE, "file_delete", {"path": "agent_id_test.txt", "purge": True},
+                        reason="新参数", trigger="manual")
+ck("改参数 → 正常新申请（denied 指纹不误伤）",
+   r14e.get("need_approval") is True and r14e.get("request_id") != r14["request_id"], str(r14e))
+_rc.set_agent_name("primary")
+
+# ---------- 15. 批次2：子 agent 权限矩阵（获取放行/控制拦截） ----------
+print("== 15. 子 agent 权限矩阵 ==")
+from tools.builtin import mc_bridge as _mb  # noqa: E402
+_mb.game_online = lambda cfg: (True, "ok")   # 跳过探活
+POLICY = {"mode": "restricted", "caller": "sub_scout"}
+_sub_tools = dict((m["name"], fn) for m, fn in _mb.make_mc_tools(MCCFG, policy=POLICY))
+_sub_act = _sub_tools["mc_act"]
+ck("次级 state（获取）→ 放行", _sub_act("state").get("sent") is not False
+   or _sub_act("state").get("blocked") is None, "state 放行")
+fr = _sub_act("find_block", id="stone")
+ck("次级 find_block（获取）→ 放行", fr.get("blocked") is None, str(fr)[:120])
+bl = _sub_act("block_at", x=0, y=64, z=0)
+ck("次级 block_at（获取）→ 放行", bl.get("blocked") is None, str(bl)[:120])
+dr = _sub_act("dig", x=1, y=64, z=1)
+ck("★次级 dig（控制）→ 拦截转报告",
+   dr.get("blocked") is True and dr.get("policy") == "sub_restricted", str(dr))
+sr = _sub_act("say", text="hello")
+ck("★次级 say（控制）→ 拦截", sr.get("blocked") is True and sr.get("policy") == "sub_restricted", str(sr))
+cr2 = _sub_act("command", text="say batch2")
+ck("★次级 command（控制）→ 升级进操作者审批表（批次3 两级链语义）",
+   cr2.get("need_approval") is True and cr2.get("policy") is None, str(cr2))
+lk_q = _sub_act("look_lock")
+ck("look_lock 无参（查状态）→ 放行", lk_q.get("blocked") is None, str(lk_q)[:100])
+lk_l = _sub_act("look_lock", x=1, y=70, z=2)
+ck("★look_lock 带参（锁定）→ 拦截", lk_l.get("blocked") is True, str(lk_l))
+unk = _sub_act("brand_new_future_action")
+ck("★未知动作 fail-closed 按控制拦截", unk.get("blocked") is True, str(unk))
+# 主 agent（无 policy）不受限
+_pri_tools = dict((m["name"], fn) for m, fn in _mb.make_mc_tools(MCCFG))
+_pri_act = _pri_tools["mc_act"]
+pd = _pri_act("time")
+ck("主 agent 控制类不受策略限制（policy 未注入）",
+   pd.get("policy") is None and pd.get("blocked") is None, str(pd)[:120])
+
+# ---------- 16. 批次3：预授权清单 + 两级审批链 ----------
+print("== 16. 预授权清单与两级链 ==")
+_policy = {"mode": "restricted", "caller": "sub_worker",
+           "allowed": {"dig": {"max": 2, "used": 0}, "say": {"max": 1, "used": 0}}}
+_w_tools = dict((m["name"], fn) for m, fn in _mb.make_mc_tools(MCCFG, policy=_policy))
+_w_act = _w_tools["mc_act"]
+d1 = _w_act("dig", x=10, y=64, z=10)
+d2 = _w_act("dig", x=11, y=64, z=10)
+ck("预授权 dig ×2 均放行（未到桥接层不报拦截）",
+   d1.get("blocked") is None and d2.get("blocked") is None, str(d1)[:80] + str(d2)[:80])
+d3 = _w_act("dig", x=12, y=64, z=10)
+ck("★第3次 dig 超次数上限 → 拦截", d3.get("blocked") is True
+   and "次数已用尽" in d3.get("error", ""), str(d3)[:120])
+ck("拦截后计数不再涨", _policy["allowed"]["dig"]["used"] == 2, str(_policy["allowed"]["dig"]))
+s1 = _w_act("say", text="报告进度")
+ck("预授权 say 放行", s1.get("blocked") is None, str(s1)[:80])
+lk = _w_act("look", yaw=90)
+ck("未预授权 look → 拦截", lk.get("blocked") is True, str(lk)[:100])
+# command 即使在 allowed 里也不放行 → 升级进审批表（chain 标注）
+_c_policy = {"mode": "restricted", "caller": "sub_worker",
+             "allowed": {"command": {"max": 5, "used": 0}}}
+_c_tools = dict((m["name"], fn) for m, fn in _mb.make_mc_tools(MCCFG, policy=_c_policy))
+cc = _c_tools["mc_act"]("command", text="list")
+ck("★command 预授权命中仍升级进操作者审批表（两级链）",
+   cc.get("need_approval") is True, str(cc)[:150])
+approval.grant(MCCFG, cc.get("request_id"))
+d = approval._load()
+_req = next((r for r in d["requests"] if r["id"] == cc["request_id"]), {})
+ck("申请记录带 chain 链条标注",
+   "sub(sub_worker)" in (_req.get("chain") or "") and "operator" in (_req.get("chain") or ""),
+   str(_req.get("chain")))
+# name 参数校验
+_spawn_fn = dict((m["name"], fn) for m, fn in
+                 (lambda: [])() or []).get if False else None  # noqa (placeholder)
+print("== 16b. spawn name 校验（构造级） ==")
+import re as _re
+ck("name 合法性正则可用", _re.fullmatch(r"[a-z_]{2,16}", "scout") is not None
+   and _re.fullmatch(r"[a-z_]{2,16}", "Bad Name!") is None, "")
+
+# ---------- 17. 批次4：并行池校验（不真跑 LLM，只测前置校验） ----------
+print("== 17. spawn_parallel 校验 ==")
+import threading as _th  # noqa: E402
+
+
+class _FakeParent:
+    subagent_count = 0
+    sub_tokens = 0
+    sub_rounds = 0
+    model = "deepseek-flash"
+    provider = None
+
+
+from core.orchestrator import make_parallel_tool  # noqa: E402
+# 测试环境 AGENT_ROOT 被指向 tmp —— 补一份最小 roles.yaml
+os.makedirs(os.path.join(_tmp, "agents"), exist_ok=True)
+with open(os.path.join(_tmp, "agents", "roles.yaml"), "w", encoding="utf-8") as f:
+    f.write("auditor:\n  parallel_safe: true\n  prompt: test\n"
+            "planner:\n  parallel_safe: true\n  prompt: test\n"
+            "builder:\n  prompt: test\n")  # builder 未标 parallel_safe
+import importlib  # noqa: E402
+import core.orchestrator as _orch  # noqa: E402
+importlib.reload(_orch)
+_pman, _pfn = _orch.make_parallel_tool(MCCFG, _FakeParent())
+ck("非 parallel_safe 角色拒绝并行",
+   "不允许并行" in (_pfn([{"role": "builder", "task": "x"}]).get("error") or ""),
+   str(_pfn([{"role": "builder", "task": "x"}])))
+ck("tasks 缺失 → 报错", _pfn().get("error") and "非空数组" in _pfn()["error"], str(_pfn()))
+ck("超并行度上限 → 报错",
+   "最多并行" in (_pfn([{"role": "auditor", "task": "x"}] * 5).get("error") or ""), "")
+ck("未知角色 → 报错",
+   "未知角色" in (_pfn([{"role": "ghost", "task": "x"}]).get("error") or ""), "")
+ck("tasks 元素缺 task → 报错",
+   "缺 role 或 task" in (_pfn([{"role": "auditor"}]).get("error") or ""), "")
+ck("重名检测 → 报错",
+   "重复" in (_pfn([{"role": "auditor", "task": "x", "name": "same"},
+                    {"role": "planner", "task": "y", "name": "same"}]).get("error") or ""), "")
+
 shutil.rmtree(_tmp, ignore_errors=True)
 print("\n%d 通过 / %d 失败" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

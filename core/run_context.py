@@ -30,3 +30,17 @@ def is_untrusted_trigger():
     ★注意：scheduled 唤醒处理的是聊天积压，其内容同样不可信，故一并计入。
     """
     return trigger() in ("mention", "scheduled")
+
+
+# ---------- 触发 agent 身份（2026-10-18 批次1）----------
+# 审批申请需要知道"是哪个 agent 触发的"（primary / sub_<name>），
+# 与 trigger 同一套 TLS 机制；并行线程池下每个 worker 线程各自设置，天然隔离。
+
+def set_agent_name(name):
+    """设置当前线程正在执行的 agent 名（primary / sub_xxx）。"""
+    _tls.agent_name = str(name or "primary").strip()[:32] or "primary"
+
+
+def agent_name():
+    """当前 agent 名；未设置 → primary。"""
+    return getattr(_tls, "agent_name", "primary")

@@ -21,3 +21,18 @@ planner:
   tools: []
   file_mode: "off"      # ★必须加引号：YAML 1.1 把裸 off 解析成布尔 False（已在 normalize_mode 兜底）
   allowed_models: any
+
+# ★parallel_safe（批次4）：允许进并行池的角色——必须是纯只读/纯分析角色，
+# 不得含任何游戏控制动作（游戏动作必须主 agent 串行执行）。
+
+# 侦察兵（0.2.1.42 验证+常驻）：带 mc 工具的只读侦察角色。
+# 控制类动作由 mc_policy 拦截/预授权约束（批次2/3），本体只装只读+受限 mc 工具。
+scout:
+  parallel_safe: true
+  prompt: |
+    你是侦察 agent：只用只读/获取类动作（state/find_block/scan_region/block_at/entities/players/
+    get_inventory/get_screen 等）收集信息并汇报。被策略拦截的控制动作如实记录进报告
+    （写明你想做什么+被拦截），不要反复重试。报告≤10行。
+  tools: [mc_state, mc_act]
+  file_mode: "off"
+  allowed_models: any

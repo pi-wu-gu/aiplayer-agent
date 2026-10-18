@@ -141,7 +141,9 @@ def _check_allowlist(cfg, argv):
     if "/" in prog or "\\" in prog:
         return False, None, ("白名单模式只接受**裸程序名**（依赖 PATH 解析），不接受显式路径: %s" % prog)
     if prog.lower() not in allow:
-        return False, None, ("程序 %s 不在白名单内（当前白名单: %s）" % (prog, allow))
+        # ★NOT_IN_ALLOWLIST: 前缀标记（2026-10-18 P1）：这种情况可走授权申请；
+        # 显式路径/空白名单/PATH 找不到是结构性错误，审批也没意义，继续硬拒。
+        return False, None, ("NOT_IN_ALLOWLIST:程序 %s 不在白名单内（当前白名单: %s）" % (prog, allow))
     resolved = shutil.which(prog)
     if not resolved:
         return False, None, ("PATH 里找不到程序: %s" % prog)
@@ -170,9 +172,33 @@ def execute(cfg, argv=None, cmd=None, timeout=None, workdir=None):
     # 闸 3：白名单
     ok, resolved, why = _check_allowlist(cfg, lst)
     if not ok:
-        _audit(cfg, {"ts": time.time(), "trigger": run_context.trigger(), "argv": lst,
-                     "ok": False, "reason": "allowlist: " + why})
-        return {"ok": False, "reason": why, "argv": lst}
+        # ★越白名单走授权申请（2026-10-18 P1）：仅 NOT_IN_ALLOWLIST 可申请（critical），
+        # 其余结构性错误照旧硬拒。指纹=完整 argv+workdir，重试必须同参数。
+        # ★令牌消费放行后必须跳过下方硬拒 return（file_delete 同款坑：check 通过
+        # 却继续 return 拒绝——令牌被白白消费且操作不执行）。
+        approved = False
+        if why and why.startswith("NOT_IN_ALLOWLIST:"):
+            from core import approval
+            aargs = {"argv": lst, "workdir": str(workdir) if workdir else None}
+            if approval.check(cfg, "shell_exec", aargs):
+                resolved = shutil.which(lst[0])
+                if not resolved:
+                    return {"ok": False, "reason": "PATH 里找不到程序: %s" % lst[0], "argv": lst}
+                approved = True
+            elif approval.enabled(cfg):
+                _audit(cfg, {"ts": time.time(), "trigger": run_context.trigger(), "argv": lst,
+                             "ok": False, "reason": "allowlist-approval-requested"})
+                return approval.require(
+                    cfg, "shell_exec", aargs,
+                    reason="命令越白名单: %s" % " ".join(str(x) for x in lst)[:80],
+                    risk="critical",
+                    how_to="控制台「🛡 授权申请」批准后，用**完全相同的参数**再调一次 shell_exec 即执行。")
+            else:
+                why = why[len("NOT_IN_ALLOWLIST:"):]
+        if not approved:
+            _audit(cfg, {"ts": time.time(), "trigger": run_context.trigger(), "argv": lst,
+                         "ok": False, "reason": "allowlist: " + why})
+            return {"ok": False, "reason": why, "argv": lst}
 
     cwd = _workdir(cfg, workdir)
     if not os.path.isdir(cwd):
