@@ -39,6 +39,16 @@ import time
 from core import config_loader
 
 KINDS = ("day", "week", "month", "year")
+
+# ★period 白名单（2026-10-18 修）：period 由 agent（LLM）传入并直接拼进文件路径，
+# 不校验的话 "../x" 之类可以逃出档案目录（读通道=存在性/长度弱探测，搬移路径另有
+# items 过滤守住，但输入校验应当在最前面）。每种层一个精确格式。
+_PERIOD_RES = {
+    "day": re.compile(r"^\d{4}-\d{2}-\d{2}$"),
+    "week": re.compile(r"^\d{4}-W\d{2}$"),
+    "month": re.compile(r"^\d{4}-\d{2}$"),
+    "year": re.compile(r"^\d{4}$"),
+}
 _SUBDIR = {"day": "day", "week": "week", "month": "month", "year": "year",
            "unsorted": "unsorted"}
 
@@ -287,8 +297,11 @@ def commit(cfg, root, kind, period, today=None):
     if kind not in KINDS:
         return {"ok": False, "reason": "kind 必须是 %s 之一，实得 %r" % (list(KINDS), kind)}
     period = (period or "").strip()
-    if not period:
-        return {"ok": False, "reason": "缺少 period（如 2026-10-18 / 2026-W42 / 2026-10 / 2026）"}
+    if not _PERIOD_RES[kind].match(period):
+        return {"ok": False, "reason": "period 格式不对：%r（%s 层应为 %s，如 %s）"
+                % (period, kind, _PERIOD_RES[kind].pattern,
+                   {"day": "2026-10-18", "week": "2026-W42",
+                    "month": "2026-10", "year": "2026"}[kind])}
 
     tgt = target_path(root, kind, period)
     if not os.path.isfile(tgt):

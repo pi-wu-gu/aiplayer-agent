@@ -142,7 +142,15 @@ def _nearby_granted(d, tool, args):
 
 
 def _new_id(d):
-    return "%s%02d" % (time.strftime("%H%M%S"), len(d["requests"]) % 100)
+    """id = HHMMSS + 请求序号两位。★同秒且序号回绕（历史满 100 条）会撞 id，
+    撞了就顺延序号重试——id 在状态文件内必须唯一（grant/deny 都按 id 找记录）。"""
+    used = {r.get("id") for r in d["requests"]}
+    n = len(d["requests"]) % 100
+    while True:
+        rid = "%s%02d" % (time.strftime("%H%M%S"), n)
+        if rid not in used:
+            return rid
+        n = (n + 1) % 100
 
 
 # ---------- 对外：调用方用这两个 ----------

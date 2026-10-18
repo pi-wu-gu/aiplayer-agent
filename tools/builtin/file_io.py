@@ -84,6 +84,31 @@ def _norm(path):
     return path.lower() if WINDOWS else path
 
 
+# ---------- 敏感文件拦截（2026-10-18） ----------
+# ★为什么在路径层拦而不是单个工具里拦：file_copy 能把密钥复制成普通文件再读，
+#   只堵 read 必被绕过。读取/写入的每个入口都过 is_sensitive。
+# keys.yaml     = API 密钥（读 → 进 LLM 上下文/日志/外部 API = 外泄；写 → 被诱导换钥）
+# approvals.json = 审批令牌状态（写 → 可伪造 grant 绕过审批体系——args_key 是 sha1，
+#                  源码就在 agent 手里，完全可以自算）
+# config_loader 直读 keys.yaml 不走工具层，框架自身加载不受影响。
+SENSITIVE_BASENAMES = {"keys.yaml", "approvals.json"}
+
+
+def is_sensitive(real):
+    """路径是否指向敏感文件（basename 精确匹配，Windows 忽略大小写）。"""
+    base = os.path.basename(str(real))
+    if WINDOWS:
+        base = base.lower()
+    return base in SENSITIVE_BASENAMES
+
+
+def sensitive_block(real):
+    """对敏感文件的统一拒绝回复（说明原因，别让 agent 反复试）。"""
+    return {"ok": False, "blocked": True,
+            "reason": "敏感文件拒绝访问：%s（含密钥/审批状态；防聊天注入把密钥带进上下文）"
+                      % os.path.basename(str(real))}
+
+
 def _inside(root, target):
     root_n, target_n = _norm(root), _norm(target)
     if target_n == root_n:
@@ -172,6 +197,8 @@ def make_file_tools(cfg, mode_override=None):
         real, gate = safe_path_gated(cfg, path, "file_read", {"path": path}, risk="medium")
         if gate is not None:
             return gate
+        if is_sensitive(real):
+            return sensitive_block(real)
         if os.path.isdir(real):
             # 目录 → 列条目（名称/类型/大小），供 agent 定位文件
             out = []
@@ -189,6 +216,8 @@ def make_file_tools(cfg, mode_override=None):
         real, gate = safe_path_gated(cfg, path, "file_write", {"path": path}, risk="medium")
         if gate is not None:
             return gate
+        if is_sensitive(real):
+            return sensitive_block(real)
         os.makedirs(os.path.dirname(real) or ".", exist_ok=True)
         mode_f = "a" if append else "w"
         with open(real, mode_f, encoding="utf-8") as f:

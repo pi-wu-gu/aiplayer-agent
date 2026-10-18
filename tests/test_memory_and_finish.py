@@ -183,6 +183,17 @@ st = mem.status(mcfg, root, today=datetime.date(2026, 11, 2))
 ck("★周/月总结后日档仍保留（成品明细不搬走）", st.get("day_n") == 1, str(st))
 ck("status 返回分层计数", st.get("week_n") == 1 and st.get("month_n") == 1, str(st))
 
+# ---------- period 白名单（2026-10-18 新增） ----------
+# period 由 LLM 传入并直接拼进路径，必须先过格式校验（防 "../x" 逃出档案目录）
+print("== period 白名单 ==")
+bad1 = mem.commit(mcfg, root, "day", "../../evil")
+ck("★period 穿越被格式校验拒绝", bad1.get("ok") is False, str(bad1))
+bad2 = mem.commit(mcfg, root, "year", "2026-W42")
+ck("★层与格式不匹配被拒（year 层收到周格式）", bad2.get("ok") is False, str(bad2))
+bad3 = mem.commit(mcfg, root, "month", "")
+ck("★空 period 被拒（原行为保持）", bad3.get("ok") is False, str(bad3))
+# 有效格式的正常路径由上方既有用例覆盖（day/week/month commit 均走白名单正则）
+
 shutil.rmtree(_tmp, ignore_errors=True)
 print("\n%d 通过 / %d 失败" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

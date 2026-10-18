@@ -119,6 +119,8 @@ def _mkdir(cfg, path):
 
 def _stat(cfg, path):
     real = file_io.safe_path(cfg, path)
+    if file_io.is_sensitive(real):
+        return file_io.sensitive_block(real)
     if not os.path.exists(real):
         return {"ok": False, "reason": "不存在: %s" % path}
     st = os.stat(real)
@@ -137,6 +139,9 @@ def _stat(cfg, path):
 def _copy(cfg, src, dst, overwrite=False):
     s = file_io.safe_path(cfg, src)
     d = file_io.safe_path(cfg, dst)
+    # ★敏感文件双向拦：复制源=外泄（复制成普通文件再读），复制目标=覆盖密钥/审批状态
+    if file_io.is_sensitive(s) or file_io.is_sensitive(d):
+        return file_io.sensitive_block(s if file_io.is_sensitive(s) else d)
     if not os.path.exists(s):
         return {"ok": False, "reason": "源不存在: %s" % src}
     if os.path.exists(d) and not overwrite:
@@ -168,13 +173,26 @@ def _delete(cfg, path, recursive=False, purge=False):
     mode = _cfg_mode(cfg)
     if mode == "off":
         return {"ok": False, "reason": "删除功能已关闭（permissions.destructive_file=off）"}
+    args = {"path": path, "recursive": bool(recursive), "purge": bool(purge)}
+    approved_out_of_root = False
     try:
         real = file_io.safe_path(cfg, path)
-    except ValueError as e:
-        # ★越界也接入授权体系：让操作者有机会临时放行一次
-        return approval.require(cfg, "file_delete", {"path": path},
-                                reason="路径越界，申请临时放行", risk="critical",
-                                how_to="批准后该路径本次放行；路径不在白名单根内，请确认无误。")
+    except ValueError:
+        # ★越界也接入授权体系：让操作者有机会临时放行一次。
+        # ★2026-10-18 修（两处）：①令牌消费（approval.check）必须在异常分支内做——
+        #   原先只在这里 require，批准后重试依然先抛 ValueError、永远走不到下方的
+        #   check，形成"批了也白批"死循环（实测：批准后重试又生成新申请，文件未删）。
+        #   ②指纹必须与主流程闸门共用同一个 args（含 recursive/purge）——
+        #   第一版修复用 {"path":...} 申请、主流程用全量 args 校验，第二次闸门
+        #   永远不匹配，令牌被白白消费。放行后跳过主流程闸门（approved_out_of_root），
+        #   但保护清单检查照常生效，"越界+保护路径"组合仍然删不掉。
+        if approval.check(cfg, "file_delete", args):
+            real = os.path.realpath(str(path or ""))
+            approved_out_of_root = True
+        else:
+            return approval.require(cfg, "file_delete", args,
+                                    reason="路径越界，申请临时放行", risk="critical",
+                                    how_to="批准后该路径本次放行；路径不在白名单根内，请确认无误。")
     if _is_protected(cfg, real):
         return {"ok": False, "reason": "保护清单内，禁止删除: %s" % _rel(cfg, real)}
     if not os.path.exists(real):
@@ -184,8 +202,8 @@ def _delete(cfg, path, recursive=False, purge=False):
         if n:
             return {"ok": False, "reason": "目录非空（%d 项）：需 recursive=true" % n}
 
-    args = {"path": path, "recursive": bool(recursive), "purge": bool(purge)}
-    if mode == "approval" and not approval.check(cfg, "file_delete", args):
+    if (mode == "approval" and not approved_out_of_root
+            and not approval.check(cfg, "file_delete", args)):
         return approval.require(
             cfg, "file_delete", args,
             reason="删除 %s（purge=%s 真删/软删）" % (_rel(cfg, real), purge),
@@ -209,7 +227,9 @@ def _delete(cfg, path, recursive=False, purge=False):
             break
     root = root or os.path.dirname(real)
     rel = os.path.relpath(real, root)
-    trash = os.path.join(root, ".trash", time.strftime("%Y%m%d_%H%M%S"), rel)
+    # ★批次名带毫秒：同秒两次软删并进同一批次会让恢复时两批文件混在一起
+    batch = time.strftime("%Y%m%d_%H%M%S") + "_%03d" % int((time.time() % 1) * 1000)
+    trash = os.path.join(root, ".trash", batch, rel)
     os.makedirs(os.path.dirname(trash), exist_ok=True)
     shutil.move(real, trash)
     return {"ok": True, "deleted": _rel(cfg, real),
@@ -258,6 +278,9 @@ def _restore(cfg, name=None):
 
 def _grep(cfg, pattern, path="", glob="*", max_hits=50, max_line=200):
     real = file_io.safe_path(cfg, path)
+    # 直接指定敏感文件 → 拒绝；目录扫描 → 跳过敏感文件（内容会进 LLM 上下文）
+    if os.path.isfile(real) and file_io.is_sensitive(real):
+        return file_io.sensitive_block(real)
     targets = []
     if os.path.isfile(real):
         targets = [real]
@@ -266,7 +289,9 @@ def _grep(cfg, pattern, path="", glob="*", max_hits=50, max_line=200):
             dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", ".trash")]
             for fn in files:
                 if fnmatch.fnmatch(fn, glob):
-                    targets.append(os.path.join(root, fn))
+                    fp = os.path.join(root, fn)
+                    if not file_io.is_sensitive(fp):
+                        targets.append(fp)
             if len(targets) > 2000:
                 break
     hits = []
