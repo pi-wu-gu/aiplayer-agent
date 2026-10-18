@@ -42,7 +42,7 @@ Windows 快捷方式：`scripts/启动agent.bat` / `scripts/停止agent.bat`。
 | 网络 / 成本 | `web_fetch` `balance_query` |
 | 自管 | `wake_blacklist` `keyword_memory` `todo_list` |
 | 动态（`run_task` 内） | `memory` `finish_run` `session_stats` `tool_result` `spawn_subagent` `spawn_parallel` |
-| 按开关关闭 | `shell_run`（`permissions.shell.enabled=false`）、`wake_words`（`daemon.allow_ai_wake_words=false`）、`keyword_memory`（`daemon.keyword_memory_enabled=false`）、`todo_list`（`daemon.todo_list_enabled=false`） |
+| 按开关关闭 | `shell_run`（`permissions.shell.enabled=false`，**默认就不注册**）、`wake_words`（`daemon.allow_ai_wake_words=false`，默认不注册）；`keyword_memory`/`todo_list` 默认注册，可被 `daemon.keyword_memory_enabled`/`todo_list_enabled` 热关 |
 
 逐项说明见游戏目录 `aiplayer/docs/框架工具.md`。
 
@@ -201,18 +201,25 @@ UI 面板：左列运行参数热改；中栏实时行为流（**工具调用与
 
 | 文件 | 覆盖 | 项数 |
 |---|---|---|
-| `tests/test_daemon.py` | 唤醒门控/积压/审查/热改 | 离线单测 |
+| `tests/test_daemon.py` | 唤醒门控/积压/审查/热改 | 27 |
 | `tests/test_daemon_live.py` | 实网冒烟（stub 掉 LLM，零成本） | 15 |
 | `tests/test_daemon_ui.py` | UI 接口：面板/行为流/参数热更新/持久化恢复 | 23 断言 |
 | `tests/test_idle_and_noise.py` | 完结判定/空转刹车/噪声过滤/提及判定/黑名单 | 31 |
-| `tests/test_memory_and_finish.py` | 分层记忆（note/status/pending/commit/归档）+ `finish_run` | 44 |
-| `tests/test_approval_and_fileops.py` | 授权申请（指纹/单次有效/过期）+ 10 个文件工具 | 47 |
+| `tests/test_memory_and_finish.py` | 分层记忆（note/status/pending/commit/归档）+ `finish_run` | 47 |
+| `tests/test_approval_and_fileops.py` | 授权申请（指纹/单次有效/过期）+ 10 个文件工具 | 113 |
 | `tests/test_review_context.py` | LLM 审查提示词必须带任务上下文 | 12 |
-| `tests/test_permissions.py` | 权限表装配（file_mode / 角色收窄） | 15 |
+| `tests/test_permissions.py` | 权限表装配（file_mode / 角色收窄） | 18 |
 | `tests/test_shell_exec.py` | shell_run 四道闸 | 21 |
 | `tests/test_keyword_memory.py` | 关键词记忆工具五动作/触发注入三态/上限警告/玩家条目/风险审查 | 30 |
 | `tests/test_todo_list.py` | 待办清单增删去重/每轮注入/空清单纪律行/上限/mtime 重载/控制台热改 | 20 |
-| `tests/test_instance_lock.py` | 单实例锁 | — |
+| `tests/test_instance_lock.py` | 单实例锁 | 9 |
+| `tests/test_wake_words.py` | 唤醒词自管（list/add/remove + 三条红线） | 8 |
+| `tests/test_web_fetch.py` | 网页抓取（剥 HTML/限额/允许来源） | 34 |
+| `tests/test_agent_home.py` | AGENT_ROOT 定位与相对路径解析 | 6 |
+| `tests/test_consumption_trigger.py` | 消耗触发（聊天/@提及/定时）判定 | 9 |
+| `tests/test_probe_degrade.py` | 探活失败降级（余额查询/模型列表不可用时不崩） | 11 |
+
+> 全量验证（2026-10-19）：以上 17 个脚本全部通过（脚本式测试，直接 `python tests/test_xxx.py` 运行，非 pytest 收集）。
 
 ## 当前状态
 - [x] 阶段 0/1：配置加载 + llm_client（含工具调用格式/重试/用量账本）+ 余量 adapter + `run.py --check`
@@ -227,6 +234,8 @@ UI 面板：左列运行参数热改；中栏实时行为流（**工具调用与
 - [x] 工程加固（2026-10-18）：分层记忆 / 通用授权审批 / 完整文件能力 / 主动收工 / 噪声与黑名单过滤
 - [x] 关键词记忆触发式激活（2026-10-19）：条目三态填充 + 注入上限警告 + 玩家专有条目 + 请求风险审查
 - [x] 待办清单每轮唤醒注入（2026-10-19）：add/del 自管 + 同任务去重 + finish_run 前应为空纪律 + 空清单也注入
+- [x] get_container 大输出限量配套（随模组 0.2.1.44/45）：PRIMARY_PROMPT 限量纪律（compact/only/max_slots/find、
+  truncated 语义、禁反复全量 dump——曾单轮烧穿 129 万 token 熔断）+ `context.py` `_dig_container` 专用摘要器
 - [ ] 阶段 4-5 见《docs/开发流程.md》第三节
 
 ## 已验证事实（滚动更新）
@@ -238,4 +247,8 @@ UI 面板：左列运行参数热改；中栏实时行为流（**工具调用与
 - **★ 上下文优化实测**：真实工具结果压缩率 86%（39291→5462 字）；历史归档使长任务 token 从 128万(60轮) 降到可预期 ~15万级
 - **★ 收工三件套效果**：同类"检查积压"唤醒从 25 轮/388,240 token 降到 **4-5 轮/5.5-7 万 token**（轮数 −84%、token −86%、耗时 −91%）
 - 合成链路全通（木板/工作台/5件木制工具），工作台为 visualworkbench 模组台（合成格内容跨会话保留）
-- 用量账本 `logs/usage.jsonl`；agent 会话日志 `logs/session_*.jsonl`；测试礼仪（聊天开始说明+结束统计）已入提示词
+- 用量账本 `logs/usage.jsonl`；agent 会话日志 `logs/session_*.jsonl`
+- ★**播报纪律（2026-10-16/17 两次用户拍板）**：任务开始不播报、收尾不播报（去测试阶段开始说明 +
+  去结束统计的游戏消息）——`session_stats` 数字只进最终汇报（日志/控制台）；游戏内 `say` 只保留
+  系统播报（重启前 say 原因 ≤50 字，PRIMARY_PROMPT 红线第 9 条；硬杀不走 shutdown hook，这是
+  重启场景唯一播报渠道）

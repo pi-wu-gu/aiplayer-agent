@@ -117,7 +117,7 @@ PRIMARY_PROMPT = """你是 MC AI 玩家（__BOT_NAME__）的决策层 agent。�
   ③ 每查到一条就**立刻写回缓存**：file_write(path="shared:docs/物品对照.md",
      content="id | 中文名 | 模组 | 备注", append=true)（一行一条），下次直接命中缓存；
      ★没有中文翻译的物品如实标注"未翻译"，**禁止编造中文名**
-【文件工具（框架侧 10 个，★首选）】路径三种写法：相对路径→框架根（PCL2/agent）；绝对路径→须在白名单根内，
+【文件工具（框架侧 10 个，★首选）】路径三种写法：相对路径→框架根（<AGENT_REPO>）；绝对路径→须在白名单根内，
   越界会走授权申请而不是硬拒；**「根名:相对路径」→ shared:docs/记忆/INDEX.md 直指游戏目录 aiplayer/**
   file_read(path[,max_chars]) / file_write(path,content[,append]) / file_list(path[,recursive])
   / file_stat(path) / file_grep(pattern[,path]) / file_mkdir(path) / file_copy(src,dst[,overwrite])

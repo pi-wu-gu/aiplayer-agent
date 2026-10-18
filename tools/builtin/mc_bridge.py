@@ -573,7 +573,7 @@ def make_mc_tools(cfg, policy=None):
                        "越写越少）；★file_read 返回的 length 是**字符数**，file_write 返回的 bytes 是"
                        "**UTF-8 字节数**，两者不等是正常现象（中文 1 字=3 字节），不是被截断。"
                        "★与 framework 的 file_* 怎么分工（2026-10-18 澄清，别再按旧说法）："
-                       "framework 工具默认根是 AGENT_ROOT（PCL2/agent），要动游戏目录就加**根名前缀**，"
+                       "framework 工具默认根是 AGENT_ROOT（<AGENT_REPO>），要动游戏目录就加**根名前缀**，"
                        "写成 shared:docs/记忆/INDEX.md 这种（根名见 permissions.roots，shared 即 aiplayer/）；"
                        "→ 读写游戏数据**推荐用 framework 的 file_***（支持 stat/grep/mkdir/copy/move/delete，"
                        "删除还带控制台授权）；mc_act 这组只能动 aiplayer/ 根、能力少，仅作兼容保留。"

@@ -23,7 +23,7 @@ import shutil
 import tempfile
 import zipfile
 
-SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # PCL2/agent
+SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # 本仓库根（<AGENT_REPO>）
 VENDOR = os.path.join(SRC, "vendor")
 EMBED_ZIP = os.path.join(VENDOR, "python-embed.zip")
 WHEELS_DIR = os.path.join(VENDOR, "wheels")
