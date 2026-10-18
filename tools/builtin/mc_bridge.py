@@ -121,7 +121,8 @@ def mc_state(cfg, fields=None):
     # screen/vehicle 无界面/未骑乘时为字符串 "null"，effects 空时省略）
     keep = ["loaded", "pos", "yaw", "pitch", "health", "food", "dead", "dim", "gamemode",
             "time", "held", "looking_at", "players", "chat",
-            "screen", "onGround", "sprinting", "flying", "vehicle", "effects",
+            "screen", "window_active", "mouse_grabbed", "onGround", "sprinting", "flying",
+            "vehicle", "effects",
             "last_action", "last_action_age_ms"]
     return {k: d.get(k) for k in keep if d.get(k) not in (None, [], {})}
 
@@ -411,7 +412,9 @@ def make_mc_tools(cfg):
                        "fields 可只取部分字段（省略返回核心全量；★不存在的字段会在 _unknown_fields "
                        "报回并附现有字段表，不会静默丢失）。"
                        "★screen 字段直接显示有无界面开着（class/title/pause；界面开着会完全屏蔽移动输入"
-                       "——移动零位移先看它），控件/槽位详情用 mc_act type=\"get_screen\"。",
+                       "——移动零位移先看它），控件/槽位详情用 mc_act type=\"get_screen\"。"
+                       "★window_active（游戏窗口是否前台）/mouse_grabbed（鼠标是否被游戏抓取）两个诊断字段："
+                       "理解『为什么某些操作没反应』时先看它们——窗口在后台时 MC 不响应任何真实输入。",
         "parameters": {"type": "object", "properties": {
             "fields": {"type": "array", "items": {"type": "string"},
                        "description": "要提取的字段名列表，省略则返回核心全量"}},
@@ -420,11 +423,38 @@ def make_mc_tools(cfg):
     act_manifest = {
         "name": "mc_act",
         "description": "对 MC AI 玩家执行一个动作并等待结果。type 为动作名（★记不准先发 type=\"actions\" 列出全部合法名，猜只会得到 unknown）。"
-                       "移动/朝向：look（x,y,z 目标点或 yaw,pitch，直接生效）、move（dir=forward/back/left/right，"
+                       "移动/朝向：look（x,y,z 目标点或 yaw,pitch，直接生效）、"
+                       "look_lock(x,y,z,duration_ms≤60000 默认5000,face 可选 up/down/north/south/"
+                       "east/west 别名top/bottom，center/auto/省略=瞄方块中心——把视角**持续锁定**朝向指定点："
+                       "每tick自动维持朝向，到期自动结束；★face 只对整数方块坐标有效（小数坐标=精确点模式，"
+                       "二选一，同时给非center的face会报错）；放置方块时常用 face=up 锁目标格下方地板的顶面；"
+                       "★也可锁实体(0.2.1.37)：target=实体id(来自entities动作,每项含 id/type/dist/pos) 或 target_type=类型id如"
+                       "minecraft:cow(64格内最近一只)，二选一且与x,y,z/face互斥，aim=center(碰撞箱中心,默认)/eyes，"
+                       "实体消失/死亡/超距8格自动结束(target_lost)——盯着生物/玩家持续对准用它；"
+                       "★任何视角操作（look/turn/mouse_move/真实鼠标）立即中断锁定；不带参数=查锁定状态）、"
+                       "move（dir=forward/back/left/right，"
                        "可加 jump/sneak/sprint、duration——★与 look 必须分两次调用；★执行后自动校验位移，"
                        "零位移会返回 _warn：先 get_screen 查界面（界面开着=移动输入被完全屏蔽），"
                        "close_screen 后重试，切勿不查原因连续重试）、turn/press(key=绑定名或物理名)/"
-                       "keys(keys=[绑定名...],duration 持续按住)/jump/sneak/select/scroll/mouse_move；"
+                       "keys(keys=[绑定名...],duration 持续按住)/"
+                       "jump(可选 duration 默认200ms)/sneak(可选 duration)/"
+                       "select(slot=0-8 快捷栏槽位)/scroll(amount=次数，正负表方向)/"
+                       "mouse_move(x,y=**窗口像素绝对坐标**，不是增量——传 dx/dy 会得到 "
+                       "mouse_err: 需要 x,y；转视角请用 look/turn，一般用不到它)；"
+                       "挖掘：dig(x,y,z,timeout_ms 500-25000 默认15000,stop——**跨tick异步**：立即返回"
+                       "dig_started，随后**必须轮询 dig_status 直至 dig_broken/dig_timeout/dig_failed 终态**"
+                       "（勿重复发起）；★dig 走 gameMode API 不经按键注入，不受鼠标抓取/窗口前台门禁影响"
+                       "（旧『keys key.attack 长按挖矿』在窗口后台时完全无效，已废弃）；"
+                       "dig_status(无参)——查挖掘任务 idle/running(带进度阶段)/终态(附墓碑 JSON)；"
+                       "放置：place(x,y,z 目标**空气格**[,side=up/down/north/south/east/west 支撑面,"
+                       "hand=main/off]——**API路径发包** useItemOn 不经按键注入，不受鼠标抓取/窗口前台"
+                       "门禁影响（旧『look瞄准+keys key.use』在窗口后台时完全失效，2026-10-17/18实锤已废弃）；"
+                       "自动选支撑面（优先下方地板→四周墙→上方天花板，避开箱子/工作台/按钮等可交互方块），"
+                       "返回 place_sent 后**必须用 place_status 或 block_at 复核**（约2-3 tick 落块）；"
+                       "★**玩家有碰撞箱（宽0.6高1.8）不是质点**：目标格与身体重叠时服务端必然驳回，"
+                       "place 直接报错并回传玩家 AABB——先 move 走开/跳起或换目标格，重试同一格无用；"
+                       "place_status(place_state,无参)——查上次放置确认 pending/placed(附landed落块id)/"
+                       "failed(附detail诊断)/unverified；"
                        "世界查询：find_block(id,radius 子串|分隔)、block_at(x,y,z)、scan_region、blockstate；"
                        "方块实体：be_nbt(可选 x/y/z 或先 look 对准,可选 key=顶层键)——读任意方块实体已同步"
                        "NBT(SNBT 截断4000)；★辉光管板 bits_n_bobs:nixie_board 的显示文字就在这（据点南侧"
@@ -454,10 +484,37 @@ def make_mc_tools(cfg):
                        "★维度网络终端才是玩家区0-35/存储区36+；点在背包区=动自己的东西，会收到 _zone_warn)、"
                        "get_inventory（★只返回你自己那36格，界面开着也看不到容器内容）、"
                        "cont_button(id：切石机=配方索引)；"
-                       "其他：state/time/say/players(仅附近)/entities/get_inventory/command(cmd)/"
+                       "其他：state/time/say/players(仅附近)/entities(每项含 id/type/dist/pos,"
+                       "id 供 look_lock target=直锁)/get_inventory/command(cmd)/"
                        "online_players(全服在线Tab名单，按延迟排序)/ping；"
-                       "★模组没有 place/dig/goto/net_click/net_search/cont_open/cont_close："
-                       "放方块=look 瞄准目标格下方地板顶面中心+keys key.use 250ms；挖方块=look 瞄准+keys key.attack 1000ms；"
+                       "联机：connect(address=可选，缺省用配置地址——重连/换服用，会清零自动连接预算)；"
+                       "★自建区文件动作（数据在游戏目录 aiplayer/ 下）——"
+                       "★【已弃用 · 保留兼容，2026-10-18】优先用框架侧 file_* 工具："
+                       "file_read/file_write(append)/file_list/file_stat/file_grep/"
+                       "file_mkdir/file_copy/file_move/file_delete/file_restore——"
+                       "它们不依赖模组（脱离模组只丢游戏干涉能力，文件工作照常）、能力更全、"
+                       "删除带控制台授权；下面这组仅在你确实要动 aiplayer/ 根内老旧数据时才用："
+                       "file_read(path[,max_chars])、file_write(path,content)、"
+                       "file_append(path,content)、file_list(path)——路径相对 aiplayer/ 根（越界拒绝）；"
+                       "★file_write 只有 path/content 两个参数，**没有 append，一律整文件覆盖**；"
+                       "要追加必须用独立的 file_append（真追加，不会覆盖）——别把长笔记用 file_write "
+                       "反复「读回全文+改+覆盖」，那样每次都会丢内容（2026-10-18 实锤：日档 840→522→386 字"
+                       "越写越少）；★file_read 返回的 length 是**字符数**，file_write 返回的 bytes 是"
+                       "**UTF-8 字节数**，两者不等是正常现象（中文 1 字=3 字节），不是被截断。"
+                       "★与 framework 的 file_* 怎么分工（2026-10-18 澄清，别再按旧说法）："
+                       "framework 工具默认根是 AGENT_ROOT（PCL2/agent），要动游戏目录就加**根名前缀**，"
+                       "写成 shared:docs/记忆/INDEX.md 这种（根名见 permissions.roots，shared 即 aiplayer/）；"
+                       "→ 读写游戏数据**推荐用 framework 的 file_***（支持 stat/grep/mkdir/copy/move/delete，"
+                       "删除还带控制台授权）；mc_act 这组只能动 aiplayer/ 根、能力少，仅作兼容保留。"
+                       "docs=文档目录、tools=自建工具索引；"
+                       "Agent进程：agent_status（只读：8770 在线/归属/配置一览；agent_start/agent_stop "
+                       "会拉起/停掉 sidecar 进程，勿乱用）；"
+                       "内置AI：llm_chat(prompt——模组侧直连 LLM，networkEnabled 关时缺席)、llm_ping；"
+                       "★模组没有 goto/net_click/net_search/cont_open/cont_close："
+                       "放方块=用 place 动作（见「放置」组，0.2.1.39 起）——**不要再用 look+keys key.use 模拟放置**"
+                       "（真实按键链路有鼠标抓取门禁，窗口后台时零效果，2026-10-17/18 实锤）；"
+                       "挖方块=用 dig 动作（见「挖掘」组）——**不要再用 keys key.attack 长按模拟挖矿**"
+                       "（真实按键链路有鼠标抓取门禁，窗口后台时零进度，2026-10-17 实锤）；"
                        "开界面=look 瞄准+keys key.use 700ms；关界面=close_screen；"
                        "维度网络=press key.keyboard.o 开终端→screen_type index=8 中文名搜索→screen_click 按 cx/cy 取放；"
                        "★取出三步缺一不可：①空光标 screen_click 存储槽（物品到光标）②再 screen_click 快捷栏空槽"

@@ -55,9 +55,11 @@ def main():
     started = threading.Event()
     release = threading.Event()
 
+    # ★注意：这里的签名必须跟 core/runner.run_task 一致（trigger/stop_info 是后加的）。
+    #   2026-10-18 曾因只修了 test_daemon_ui.py 的同类 stub、漏了这里，导致本测试长期 FAIL。
     def fake_run_task(cfg_, task, max_rounds=None, round_hook=None,
-                      stop_event=None, verbose=True):
-        runs.append({"task": task, "stop_event": stop_event})
+                      stop_event=None, verbose=True, trigger="manual", stop_info=None):
+        runs.append({"task": task, "stop_event": stop_event, "trigger": trigger})
         started.set()
         release.wait(timeout=20)
         return "(stub 收尾)", {"rounds": 3}
@@ -78,10 +80,14 @@ def main():
     check("status: 初始 idle", st["state"] == "idle")
 
     # ---- 喂一条@提及 + 一条普通消息（只喂一次，之后恢复真实轮询） ----
+    # ★2026-10-18 修正：@提及必须由**别人**发出（<PlayerB>），不能写成 <ExampleBot>——
+    #   后者会被 is_mention 判为"bot 自己的发言"而排除（防自激），导致 runs 为空。
+    #   这正是新规则"无发言人/自己发言不算提及"该有的行为，测试数据要跟真实场景一致。
     fake_entries = [
-        {"id": 9001, "t": time.time(), "text": "[world] <ExampleBot>: @ExampleBot 看看经验块"},
-        {"id": 9002, "t": time.time(), "text": "[world] <Lyuan666>: 今天天气不错"},
+        {"id": 9001, "t": time.time(), "text": "[world] <PlayerB>: @ExampleBot 看看经验块"},
+        {"id": 9002, "t": time.time(), "text": "[world] <PlayerB>: 今天天气不错"},
         {"id": 9003, "t": time.time(), "text": "[world] <ExampleBot>: [自动] 测试开始: 自己的发言"},
+        {"id": 9004, "t": time.time(), "text": "ExampleBot is now sleeping. [1/3]"},
     ]
     real_fetch = d._fetch_chat
     fed = {"done": False}

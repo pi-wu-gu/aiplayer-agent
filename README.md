@@ -1,10 +1,12 @@
 # agent —— MC AI 玩家决策层 & 通用多 agent 框架
 
-与 `PCL2/AI/`（MC 客户端桥接系统）同级配套。LLM 通过工具循环驱动：多 provider 密钥管理、余量查询与成本熔断、主从多 agent 协同（次级可选模型）、agent 自研工具沙箱。
+与 `PCL2/AI/`（MC 客户端桥接系统）同级配套。LLM 通过工具循环驱动：多 provider 密钥管理、余量查询与成本熔断、主从多 agent 协同（次级可选模型）、分层记忆、危险操作授权审批、agent 自管唤醒词与唤醒黑名单。
 
 ## 文档
 - 《docs/开发流程.md》—— 五层架构 / 目录规划 / 阶段 0-5 开发路线（每阶段带验收标准）
+- 《docs/参数清单.md》—— `config/config.yaml` 逐键说明 + 热改白名单（★改动后请同步更新）
 - 《docs/可行性分析与查漏补缺.md》—— 五项需求逐项可行性 + 15 条查漏清单
+- 《docs/runtime/》—— 参考部署快照（游戏目录 `aiplayer/docs/` 为运行时最新版）
 - 《../AI/docs/操作注意事项.md》—— MC 桥接协议与红线（agent 层对接依据）
 
 ## 快速开始
@@ -27,15 +29,53 @@
 （随模组 jar 分发，模组侧自动解压运行；内嵌运行时仅 Windows）。
 Windows 快捷方式：`scripts/启动agent.bat` / `scripts/停止agent.bat`。
 
+> ★**热部署（改 Python 源码不用重打 bundle、不用重启 MC）**：模组按版本目录缓存
+> （`<gamedir>/aiplayer-agent/<mod_version>/`），把改动的文件复制进该目录 →
+> 杀 `run.py --daemon` 进程 → 手动拉起即可。bundle 变了才需要升 `mod_version`。
+
+## 工具面（17 静态 + 5 动态 + 2 按开关）
+
+| 组 | 工具 |
+|---|---|
+| 游戏桥接 | `mc_state` `mc_act` `mc_batch` `mc_chat` |
+| 文件（框架侧，★首选） | `file_read` `file_write` `file_list` `file_stat` `file_grep` `file_mkdir` `file_copy` `file_move` `file_delete` `file_restore` |
+| 网络 / 成本 | `web_fetch` `balance_query` |
+| 自管 | `wake_blacklist` |
+| 动态（`run_task` 内） | `memory` `finish_run` `session_stats` `tool_result` `spawn_subagent` |
+| 按开关关闭 | `shell_run`（`permissions.shell.enabled=false`）、`wake_words`（`daemon.allow_ai_wake_words=false`） |
+
+逐项说明见游戏目录 `aiplayer/docs/框架工具.md`。
+
 ## 权限表（config.yaml `permissions:` 节）
 
 装配期生效：**被禁的工具根本不注册**（模型看不到，不浪费轮次），不是"注册后报错"。主 agent 与次级 agent 走同一条装配路径（`core/orchestrator.build_registry`）。
 
 | 配置 | 取值 | 管什么 |
 |---|---|---|
-| `permissions.file_mode` | `full` / `readonly` / `off` | `file_read` `file_write`（off 时整组不注册） |
+| `permissions.file_mode` | `full` / `readonly` / `off` | 文件工具整组（off → 全不注册；readonly → 只注册只读那几个） |
 | `permissions.roots` | 具名白名单根 | 文件工具的边界；相对路径默认落 `default_root` |
+| `permissions.destructive_file` | `off` / **`approval`** / `free` | 删除能力档位（默认申请授权 + 软删可恢复） |
+| `permissions.approval` | `enabled` / `ttl_sec` | 授权申请体系总闸与令牌默认有效期 |
+| `permissions.web` | `enabled` / `allow_from_chat` / … | 网页抓取开关与限额 |
 | `permissions.shell` | 见下 | **★高危可选项：本机命令行执行** |
+
+> ★**配置段位置**：`shell` / `web` / `approval` / `destructive_file` 都在 **`permissions`** 下面，
+> 不是顶层。改完务必验证"真的生效"（改一个值看 `/config` 输出有没有变），否则会静默失效。
+
+### 危险操作授权审批（`core/approval.py`）
+
+```
+agent 触发高危/越界动作 → 落待审核申请（绑定 工具+参数指纹）
+        → 操作者在 8770 控制台「🛡 授权申请」点批准
+        → 生成单次有效令牌（TTL 按风险 120-600s）
+        → agent 用**相同参数**重试一次 → 执行 → 令牌用完即焚
+```
+
+- 改参数/过期/被拒 → 全部失效，需重新申请
+- 同参数重复申请会复用同一条，不刷屏
+- 参数指纹前会**归一路径**（`\`↔`/`、`//` 压缩、Windows 忽略大小写）
+- 审计落 `logs/approval_audit.log`
+- 越界路径不再硬拒，改走同一套申请（`file_io.safe_path_gated()`）
 
 ### ★本机命令行 `permissions.shell`（默认关闭）
 
@@ -60,58 +100,93 @@ Windows 快捷方式：`scripts/启动agent.bat` / `scripts/停止agent.bat`。
 >
 > 安全测试见 `tests/test_shell_exec.py`（21 项：关闭不注册/白名单/禁路径/无 shell 语义/超时/截断/聊天隔离/审计）。
 
+## 分层记忆（`core/memory.py`）
+
+```
+记忆/
+  unsorted/<日期>_<时分>_<触发源>.md   ← 一次唤醒一个文件（未总结）
+  day/YYYY-MM-DD.md  week/YYYY-Www.md  month/YYYY-MM.md  year/YYYY.md
+  raw/                                 ← 原始记录，永不压缩
+```
+
+- **到期推导**（纯推导，不用定时器）：日 < 今天 / 周 < 当前周 / 月 < 当前月 / 年 < 当前年
+- **框架搬文件、agent 只写内容**：建目录/开文件/判断到期/归档/记账全归框架；agent 连 delete 都没有
+- 顺序固定：`memory(pending)` 读源 → `file_append` 写目标档 → `memory(commit)` 提交
+- ★**只有 day 层归档源材料**（unsorted 是中间态）；日/周/月档是成品明细，永远保留
+- 总结走 agent 自身上下文，**不额外开 LLM**
+
 ## 持续运行模式（daemon）
 ```
 python run.py --daemon
 ```
-守护进程四大机制（配置见 config.yaml `daemon:` 节）：
+守护进程五大机制（配置见 config.yaml `daemon:` 节）：
 
 | 机制 | 行为 |
 |---|---|
-| 聊天监听 | 每 `poll_interval` 秒轮询桥接 /chat；**他人**发言 @提及 bot（`ExampleBot` 或 `mention_extra` 词）→ 立即唤醒运行。bot 自身 say 不触发（防自激） |
-| 定时唤醒 | 每 `wake_interval` 秒到点检查**积压未读**；有积压才触发运行，无积压只记录 |
-| 周期审查 | agent 每跑 `review_every`（默认32）轮，审查器唤醒一次：规则检查（同操作连续3次失败/连续6次失败/生命<10/token超预算）＋可选 LLM 审查（`review_llm`）。**审查有权强制停止思考**（轮边界生效，游戏内播报原因） |
+| 聊天监听 | 每 `poll_interval` 秒轮询桥接 /chat；**他人**发言 @提及 bot（`bot_names` 或 `mention_extra` 词）→ 立即唤醒。bot 自身 say 不触发（防自激）。★无 `<发言人>` 前缀的服务器广播（"X is now sleeping"/"已将X传送至…"）**不算提及** |
+| 定时唤醒 | 每 `wake_interval` 秒到点检查**积压未读**；有积压才触发，无积压只记录。★噪声（清理广播等，见 `noise_patterns`）与 bot 自己的发言**不计入积压** |
+| 周期审查 | 每 `review_every` 轮 / `review_token_budget` token 触发一次：规则检查（同操作连续3次失败/连续6次失败/生命<10/token超预算）＋ LLM 审查（`review_llm`）。**审查有权强制停止**（轮边界生效）。★LLM 审查必须带任务上下文，否则会把"只读任务"误判为空转 |
 | 唤醒门控 | 所有唤醒仅在 agent **未运行**时生效：运行中提到→记入积压；定时/手动唤醒→跳过并计数 |
+| 主动收工 | agent 调 `finish_run` 立即结束；另有完结判定（双向正则）+ **空转刹车**（推了"继续"却一个工具都没调 → 直接收尾）兜底 |
 
 进程结构：主线程=轮询+调度；worker 线程=跑一次 Agent（复用 `core/runner.py`）；
-控制API 线程=HTTP。状态（游标/积压/统计）落盘 `logs/daemon_state.json`，重启不丢。
+控制API 线程=HTTP。状态（游标/积压/统计/热改配置）落盘 `logs/daemon_state.json`，重启不丢。
 
 控制 API（默认 127.0.0.1:8770）：
 ```
-GET  /         # Web UI 面板（状态/参数/实时行为流，浏览器直接开）
-GET  /status    # idle/running、积压数、待处理提及、统计
-GET  /backlog   # 最近50条积压
-GET  /feed?n=80 # 实时行为流：思考/工具调用/审查/停止（读最新 behavior 日志）
-GET  /config    # 读取全部运行参数
-POST /config    # 热更新参数（立即生效+落盘，重启自动恢复）
-POST /wake      # 手动唤醒（运行中→409，门控）
-POST /stop      # 强制停止当前运行（轮边界生效）
+GET  /             # Web UI 面板（状态/参数/实时行为流/授权申请，浏览器直接开）
+GET  /status       # idle/running、积压数、待处理提及、统计
+GET  /backlog      # 最近50条积压（带 noise 标记）
+GET  /feed?n=80    # 实时行为流：思考/工具调用/审查/停止（读最新 behavior 日志）
+GET  /config       # 读取全部运行参数（含实际生效值）
+POST /config       # 热更新参数（立即生效+落盘，重启自动恢复）
+POST /wake         # 手动唤醒（运行中→409，门控）
+POST /stop         # 强制停止当前运行（轮边界生效）
+POST /instruct     # 从控制台下发一条临时任务（等同人工唤醒）
+GET  /approvals    # 待审核授权申请 + 审核历史
+POST /approvals/grant  # 批准（{id} 或 {"id":"*"} 全批）
+POST /approvals/deny   # 拒绝
 ```
 
-UI 面板可热设置：自动检测频率 poll_interval、定时唤醒间隔、审查周期、审查是否调 LLM、
-单次轮次上限、运行冷却、积压上限、提及名/额外触发词等；中栏实时滚动展示
-模型思考与每次工具调用（成功/失败着色），右栏一键唤醒/强制停止。
+UI 面板：左列运行参数热改；中栏实时行为流（**工具调用与深度思考默认折叠、输出默认展开**，
+点击可展开且状态跨刷新保持）；右列状态/积压/🛡 授权申请（含审核历史）。
 
 日志：`logs/daemon.log`（过程）、`logs/daemon_state.json`（状态）、
-`logs/review_日期.jsonl`（每次审查记录：轮号/结论/原因/生命/token）。
+`logs/behavior_*.log`（每轮行为流水）、`logs/session_*.jsonl`（会话全文）、
+`logs/review_日期.jsonl`（每次审查记录）、`logs/approval_audit.log`（授权审计）、
+`logs/llm_calls.jsonl` + `logs/usage.jsonl`（模型调用与 token 账本）。
 
-测试：`python tests/test_daemon.py`（离线单测16项）、
-`python tests/test_daemon_live.py`（实网冒烟15项，stub 掉 LLM 零成本）、
-`python tests/test_daemon_ui.py`（UI接口23项断言：面板/行为流/参数热更新/持久化恢复）。
+## 测试
+
+| 文件 | 覆盖 | 项数 |
+|---|---|---|
+| `tests/test_daemon.py` | 唤醒门控/积压/审查/热改 | 离线单测 |
+| `tests/test_daemon_live.py` | 实网冒烟（stub 掉 LLM，零成本） | 15 |
+| `tests/test_daemon_ui.py` | UI 接口：面板/行为流/参数热更新/持久化恢复 | 23 断言 |
+| `tests/test_idle_and_noise.py` | 完结判定/空转刹车/噪声过滤/提及判定/黑名单 | 31 |
+| `tests/test_memory_and_finish.py` | 分层记忆（note/status/pending/commit/归档）+ `finish_run` | 44 |
+| `tests/test_approval_and_fileops.py` | 授权申请（指纹/单次有效/过期）+ 10 个文件工具 | 47 |
+| `tests/test_review_context.py` | LLM 审查提示词必须带任务上下文 | 12 |
+| `tests/test_permissions.py` | 权限表装配（file_mode / 角色收窄） | 15 |
+| `tests/test_shell_exec.py` | shell_run 四道闸 | 21 |
+| `tests/test_instance_lock.py` | 单实例锁 | — |
 
 ## 当前状态
-- [x] 目录骨架 + 配置模板 + 设计文档（阶段 0 产物）
 - [x] 阶段 0/1：配置加载 + llm_client（含工具调用格式/重试/用量账本）+ 余量 adapter + `run.py --check`
-- [x] 阶段 2：Agent 核心（tool loop）+ tool_registry（schema 校验）+ 内置工具 mc_state/mc_act/file_io/balance_query
-- [x] 阶段 2.5 上下文优化：结果压缩+存档（core/context.py，规则式零额外调用）+ 历史归档 + tool_result 取回工具
-- [x] 持续运行模式（daemon）：聊天@提及唤醒/定时唤醒积压/每32轮审查可强制停止/唤醒门控（core/daemon.py + core/runner.py，测试30项全过）
-- [ ] 阶段 3-5 见《docs/开发流程.md》第三节
+- [x] 阶段 2：Agent 核心（tool loop）+ tool_registry（schema 校验）+ 内置工具
+- [x] 阶段 2.5 上下文优化：结果压缩+存档（`core/context.py`）+ 历史归档 + `tool_result` 取回
+- [x] 阶段 3：多 agent 协同（`spawn_subagent` + roles.yaml + 深度/并发限制）
+- [x] 持续运行模式（daemon）：五机制齐备，控制台可观测可干预
+- [x] 工程加固（2026-10-18）：分层记忆 / 通用授权审批 / 完整文件能力 / 主动收工 / 噪声与黑名单过滤
+- [ ] 阶段 4-5 见《docs/开发流程.md》第三节
 
-## 已验证事实（2026-10-15）
+## 已验证事实（滚动更新）
 - step（阶跃星辰）key 有效：33 个模型；对话模型用 `step-3.7-flash` / `step-5-preview`（**推理模型**，思考占 token 且在 `reasoning_content` 字段，max_tokens 须给足）；无公开余额端点
-- **DeepSeek 14:15 已恢复**：deepseek-flash / deepseek-v4-pro 可用（deepseek-chat 别名仍可用），余量 12.36 CNY；默认 provider 已切回 deepseek-flash
+- DeepSeek 可用：`deepseek-flash` / `deepseek-v4-pro`（`deepseek-chat` 别名仍可用）；**余额请用 `balance_query` 现查**，别信文档里的历史数字
 - **★ 桥接 /command 的 body 必须是 `{"commands": [动作]}`**——裸动作对象会被静默丢弃（queued:0）且不报错
-- mc_act 结果判定：对比发送前后的 last_action 变化；**last_action 多为纯文本非 JSON**（解析失败原样返回，不再当错误）
-- **★ 上下文优化实测**：真实工具结果压缩率 86%（39291→5462 字）；历史归档使长任务 token 从 128万(60轮) 降到可预期 ~15万级；agent 能正确理解"[压缩]已存档"提示并按需取回
+- **★ 模组动作失败是字符串 `<动作>_err: …`**，不是 dict 的 `error` 字段——判定成败必须认这个前缀
+- mc_act 结果判定：对比发送前后的 `last_action` 变化；**last_action 多为纯文本非 JSON**（解析失败原样返回，不再当错误）
+- **★ 上下文优化实测**：真实工具结果压缩率 86%（39291→5462 字）；历史归档使长任务 token 从 128万(60轮) 降到可预期 ~15万级
+- **★ 收工三件套效果**：同类"检查积压"唤醒从 25 轮/388,240 token 降到 **4-5 轮/5.5-7 万 token**（轮数 −84%、token −86%、耗时 −91%）
 - 合成链路全通（木板/工作台/5件木制工具），工作台为 visualworkbench 模组台（合成格内容跨会话保留）
-- 用量账本 logs/usage.jsonl；agent 会话日志 logs/session_*.jsonl；测试礼仪（聊天开始说明+结束统计）已入提示词
+- 用量账本 `logs/usage.jsonl`；agent 会话日志 `logs/session_*.jsonl`；测试礼仪（聊天开始说明+结束统计）已入提示词

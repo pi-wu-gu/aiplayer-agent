@@ -163,6 +163,39 @@ class RegistryGateTest(unittest.TestCase):
         with self.assertRaises(KeyError):
             orchestrator.build_registry_for(self.cfg, ["no_such_tool"], None)
 
+    # ---- ★2026-10-18：YAML 1.1 的 on/off 布尔陷阱（权限反转） ----
+    def test_yaml_bare_off_is_not_treated_as_full(self):
+        """`file_mode: off`（裸写）会被 PyYAML 解析成布尔 False。
+
+        旧实现 str(False or "") == "" → 落回默认 "full" —— 机主想**关掉**文件能力，
+        结果变成**全开**。这是权限反转，必须锁死。
+        """
+        import yaml
+        from tools.builtin import file_io
+        parsed = yaml.safe_load("file_mode: off")["file_mode"]
+        self.assertIs(parsed, False, "前提：PyYAML 确实把裸 off 解析成 False")
+        self.assertEqual(file_io.normalize_mode(False), "off")
+        self.assertEqual(file_io.normalize_mode(True), "full")
+        self.assertEqual(file_io.intersect("full", False), "off")
+
+    def test_role_file_mode_off_via_yaml_really_disables(self):
+        """roles.yaml 里写 file_mode: off，角色的文件工具必须真的为 0 个。"""
+        from tools.builtin import file_io
+        self.assertEqual(file_io.intersect("full", False), "off")
+        reg = orchestrator.build_registry_for(self.cfg, [], False)
+        self.assertEqual([n for n in reg.names() if n.startswith("file_")], [])
+
+    def test_roles_yaml_parses_planner_as_off(self):
+        """agents/roles.yaml 的 planner.file_mode 必须解析为 'off'（不是 False）。"""
+        import os
+        import yaml
+        from core import config_loader
+        path = os.path.join(config_loader.AGENT_ROOT, "agents", "roles.yaml")
+        roles = yaml.safe_load(open(path, encoding="utf-8"))
+        self.assertEqual(roles["planner"]["file_mode"], "off")
+        self.assertEqual(roles["auditor"]["file_mode"], "readonly")
+        self.assertIn("file_grep", roles["auditor"]["tools"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

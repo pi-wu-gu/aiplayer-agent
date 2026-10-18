@@ -53,7 +53,9 @@ def main():
     release = threading.Event()
 
     def fake_run_task(cfg_, task, max_rounds=None, round_hook=None,
-                      stop_event=None, verbose=True):
+                      stop_event=None, verbose=True, trigger="manual", stop_info=None):
+        # ★签名必须与真实 run_task 一致（2026-10-18 修）：daemon 会传 trigger/stop_info，
+        # 缺参数会抛 TypeError → 被 worker 的 except 吞掉 → /wake 看起来"没反应"。
         started.set()
         release.wait(timeout=10)
         return "(stub)", {"rounds": 1}

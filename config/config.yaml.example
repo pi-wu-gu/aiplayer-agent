@@ -43,12 +43,23 @@ mc_bridge:
 
 permissions:                  # 权限表（与模组侧 aiplayer-common.toml 的 [permissions] 同名概念）
   file_mode: full             # full | readonly | off —— 本侧只能"收窄"，不会放宽模组侧
+                              # ★写 off / readonly 时**建议加引号**（"off"）：YAML 1.1 会把裸
+                              #   off 解析成布尔 False（代码已兜底，但加引号更一眼看清）
   roots:                      # 文件工具的白名单根（具名）；shared 即模组侧的运行数据目录
     agent: "."                # 相对 AGENT_ROOT（. = 本仓库根）
     shared: "D:/mc/game/aiplayer"   # ★示例路径：改成你本机的 <游戏目录>/aiplayer
   default_root: agent         # 相对路径默认落在哪个根
   # 说明：装配期生效 —— off 时 file_* 工具根本不注册；readonly 只注册 file_read。
   #       角色的 file_mode（agents/roles.yaml）只能更严，不能更宽。
+
+  destructive_file: approval  # 删除能力档位：off（不注册 file_delete / approval（默认，需控制台批准）
+                              #   / free（直删，不建议）。★任何档位下默认都是**软删**到
+                              #   <根>/.trash/<时间戳>/，file_restore 可恢复；purge=true 才真删
+  approval:                   # ★通用授权申请体系（删除/越界路径等危险操作都走这里）
+    enabled: true             # 总闸；false 时危险操作直接拒绝（不会退化成直删）
+    ttl_sec: 300              # 批准后令牌默认有效期（秒）；实际按风险分档 120-600，单次有效
+    # 流程：agent 触发 → 落待审核申请（绑定 工具+参数指纹）→ 操作者在 8770 控制台
+    #       「🛡 授权申请」点批准 → 生成单次令牌 → agent 用**相同参数**重试 → 执行后令牌作废
 
   shell:                      # ★★ 高危可选项：允许 agent 执行**本机**命令行。默认关闭 ★★
     enabled: false            # ★默认关闭；开启时启动会打印显著危险提示
@@ -89,13 +100,30 @@ daemon:                       # 持续运行模式（python run.py --daemon）
                               #   默认关闭：开启后玩家可在聊天里让 AI 加词（上限 8 个、词长≤16、
                               #   每次增删记录触发来源）——注意这会间接放开"玩家控制唤醒行为"，滥用可回收
   ai_wake_words_max: 8        # AI 自管唤醒词数量上限
+  allow_ai_wake_blacklist: true   # ★可选项：允许 AI 自己维护**唤醒黑名单**（config/wake_blacklist.json）
+                                  #   与 noise_patterns 是并集关系：命中的文本既不算 @提及、也不计入积压。
+                                  #   三条硬红线（代码强制）：不得屏蔽 bot 自己的名字 / 不得屏蔽
+                                  #   mention_extra / 拒绝 `.*` 通杀正则。默认开（噪声过滤收益大于风险）
+  wake_blacklist_max: 20      # 黑名单条数上限
   poll_interval: 2.0          # 聊天轮询间隔（秒）
   wake_interval: 300          # 定时唤醒间隔（秒）：到点检查积压未读
   wake_check_backlog: true    # 定时唤醒仅在“有积压”时才运行
+  noise_patterns:             # 噪声正则（Python re.search，命中即**不计积压、不算提及**）
+    - '还剩下\\s*\\d+\\s*秒清理'   # 服务器清理倒计时
+    - '清理成功'
+    - '公共垃圾桶'
+    - '物品被回收'
+    - '个生物被清理'
+    - '^§?[a-zA-Z]?§?l?\\s*\\d+\\s*秒$'   # 倒计时尾行（§ = 颜色码）
+    - '请勿复读'
+    - '^\S*(退出了游戏|加入了游戏)$'      # 玩家进退服广播（2026-10-18 实测：dzmh退出了游戏）
+    - '^\S*(加入了服务器|退出了服务器)$'  # 服务器层进退服广播
   review_every: 32            # 每运行N轮唤醒审查一次行为
   review_token_budget: 60000  # ★按消耗量触发：自上次审查累计 token 超此值即提前审查（0=关闭）。
                               #   轮数与消耗任一满足都会审；长调研任务靠它兜底（单轮烧 token 很快）
-  review_llm: false           # 审查是否额外调 LLM（默认纯规则，省token）
+  review_llm: true            # 审查是否额外调 LLM。★默认开：纯规则的 R1/R2 只能查工具失败，
+                              #   而"空转"（工具全成功、反复查同一件事）规则查不出来——
+              #   2026-10-18 实测 22 条审查记录 verdict 全 null 就是这个原因
   review_model: deepseek-flash
   run_cooldown: 5             # 两次唤醒运行之间的最小间隔（秒）
   max_rounds_per_run: 60      # 单次唤醒运行的轮数上限

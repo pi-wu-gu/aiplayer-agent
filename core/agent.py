@@ -8,13 +8,24 @@ from core import llm_client
 from core.logger import AgentLogger
 
 # 工具结果失败特征（供审查判定"这次操作失败了"）
-_FAIL_MARKS = ("错误", "Error", "Exception", "Traceback", "失败", "超时", "timeout")
+# ★加 "_err:" / "denied" / "blocked"（2026-10-18 修）：模组侧的动作失败是
+# `<动作名>_err: ...` 这种**字符串**（Actions.java 里有 92 处、20 种前缀：
+# file_err/sign_err/move_err/mouse_err/dig_err/place_err…），不含"错误/失败"等词，
+# 于是被当成成功 → recent_results.ok 全程为真 → 审查器 R1（连续3次同操作失败）/
+# R2（连续6次失败）**永远不触发**（之前分析"规则查不出空转"，其实连真失败也查不出）。
+_FAIL_MARKS = ("错误", "Error", "Exception", "Traceback", "失败", "超时", "timeout",
+               "_err:", "denied", "blocked", "unknown:")
 
 
 def result_ok(result):
-    """粗判工具结果是否失败：开头60字含失败特征即判失败。"""
-    head = str(result)[:60]
-    return not any(k in head for k in _FAIL_MARKS)
+    """粗判工具结果是否失败：开头片段含失败特征、或 JSON 里 ok=false，即判失败。"""
+    head = str(result)[:200]
+    if any(k in head for k in _FAIL_MARKS):
+        return False
+    # 框架侧工具/审批/越界都回 {"ok": false, ...}
+    if '"ok": false' in head or '"ok":false' in head:
+        return False
+    return True
 
 
 class Agent:
@@ -50,6 +61,41 @@ class Agent:
         self.stop_event = stop_event
         # 最近工具结果环形缓冲（审查用：轮号/工具/参数/成败/摘要/耗时）
         self.recent_results = collections.deque(maxlen=40)
+        # ---- 空转刹车计数（2026-10-18）----
+        # 现象：定时唤醒这类"没事干"的任务，模型第 4 轮就输出完结总结，但完结判定
+        # 只认「任务完成/已完成/全部完成/测试完成」四个字面，于是"处理完毕""确认完成"
+        # "无待办""收尾"全部判为未完结 → 连推 3 次 → 25 轮 / 38.8 万 token 纯空转
+        # （实例：session_20261018_031332）。下面两个计数器用于"推了也没干活就别再推"。
+        self._tool_calls = 0                 # 本次 step 内累计工具调用数
+        self._tools_at_last_continue = -1    # 上次注入"继续"时的工具数（-1=还没推过）
+        # ---- 主动结束（2026-10-18）：agent 调 finish_run 工具即可收工，不必等
+        # 框架判定"说完没有"。finish_text 直接作为本次运行的最终答复返回。
+        self.finish_requested = False
+        self.finish_text = ""
+
+    # ---------- 完结判定 ----------
+    # 完结语义放宽：只要说了"完/毕/收尾/无待办"类词，且没有"接下来/下一步"这类续做意图，就算完结。
+    _DONE_RE = None      # 类级正则在文件末尾初始化（避免此处 import re 的命名冲突）
+    _PENDING_RE = None
+
+    def _looks_done(self, text):
+        """文本是否像"任务已完结的总结"。放宽字面 + 排除续做意图，双向判定。"""
+        import re as _re2
+        if Agent._DONE_RE is None:
+            Agent._DONE_RE = _re2.compile(
+                r"完成|完毕|收尾|结束|收工|无待办|无需(再|继续|处理|动作)|"
+                r"没有(需要|待办|剩余|其他)|无剩余|已(处理|记录|汇报|确认|核对|写入|更新)|"
+                r"没有.*可(做|执行)|暂不|到此为止")
+            Agent._PENDING_RE = _re2.compile(
+                r"接下来|下一步|然后我|继续(做|执行|检查|处理)|我先|现在(开始|去|就)|"
+                r"待会|稍后|马上(做|去)")
+        t = text or ""
+        if not Agent._DONE_RE.search(t):
+            return False
+        # 说了完结词但紧接着列"下一步"→ 不算完结
+        if Agent._PENDING_RE.search(t):
+            return False
+        return True
 
     # ---------- 记忆 ----------
     def say(self, role, content, tool_calls=None, tool_call_id=None, name=None):
@@ -156,10 +202,11 @@ class Agent:
     def step(self, user_text=None):
         """跑一轮：可选注入 user 消息，循环到 LLM 给出无工具调用的最终答复。
         auto_continue：任务未完成标志时输出纯文字→注入"继续"再跑（最多3次），防模型旁白中断任务。"""
-        import re as _re
         if user_text:
             self.say("user", user_text)
         continues = 0
+        # 空转刹车按"次 step"计量（_finalize_run 会再调一次 step，不继承上次的续跑状态）
+        self._tools_at_last_continue = -1
         for _ in range(self.max_rounds):
             self.rounds_used += 1
             # 外部强制停止信号（控制API/审查设置）：在轮边界立刻终止，不再思考
@@ -192,23 +239,33 @@ class Agent:
                             tool_call_n=len(resp["tool_calls"] or []),
                             content_head=(resp["content"] or "")[:400],
                             reasoning_head=(resp.get("reasoning") or "")[:400])
-            msg = resp["raw"]
             tcs = resp["tool_calls"]
             if not tcs:
                 text = resp["content"] or ""
-                # 纯文字但不像完结（无"完成"标记）且还有轮数 → 注入继续
+                # 纯文字：判断是真完结还是中途旁白（2026-10-18 修正）
+                # ①完结判定放宽（旧版只认 4 个字面的"完成"，"处理完毕/无待办/收尾"全漏判）
+                # ②★空转刹车：上次注入"继续"之后模型一个工具都没调就又给结论，
+                #   说明它确实认为没活干了 —— 再推只是烧 token，直接收尾。
+                idle_after_nudge = (self._tools_at_last_continue >= 0
+                                    and self._tool_calls == self._tools_at_last_continue)
                 if (self.auto_continue and continues < 3
                         and self.rounds_used < self.max_rounds
-                        and not _re.search(r"测试完成|任务完成|全部完成|已完成", text)):
+                        and not self._looks_done(text)
+                        and not idle_after_nudge):
                     continues += 1
+                    self._tools_at_last_continue = self._tool_calls
                     self.say("assistant", text)
                     self.say("user", "任务尚未完成，继续执行剩余步骤；全部完成后再输出总结。")
                     self.logger.log("auto_continue", n=continues, text_head=text[:80])
                     continue
+                if idle_after_nudge:
+                    self.logger.log("auto_continue_idle_brake", round_no=self.rounds_used,
+                                    continues=continues, text_head=text[:80])
                 self.say("assistant", text)
                 return text
             # assistant 的工具调用请求先入栈
             self.say("assistant", resp["content"], tool_calls=tcs)
+            self._tool_calls += len(tcs)   # 空转刹车计数
             for tc in tcs:
                 fn = (tc.get("function") or {})
                 name = fn.get("name")
@@ -229,6 +286,15 @@ class Agent:
                     "args": str(args)[:150], "ok": result_ok(result),
                     "head": result[:160], "elapsed": elapsed})
                 self.say("tool", result, tool_call_id=tc.get("id"), name=name)
+                # ★agent 主动收工（finish_run 工具）：立刻结束本次运行，
+                # 不等 auto_continue 判定、不等审查钩子——这是"我做完了"的显式信号。
+                if self.finish_requested:
+                    text = self.finish_text or "（agent 主动结束运行）"
+                    self._log("agent 主动结束运行: %s" % text[:80])
+                    self.logger.log("finish_run", round_no=self.rounds_used,
+                                    text_head=text[:120])
+                    self.say("assistant", text)
+                    return text
             # ---- 每轮结束：外部审查钩子（daemon 每 review_every 轮触发一次）----
             # 签名：round_hook(round_no, agent) → 返回非空字符串 = 审查要求强制停止思考（带原因）
             if self.round_hook is not None:

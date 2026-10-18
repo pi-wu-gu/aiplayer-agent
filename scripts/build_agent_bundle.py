@@ -40,6 +40,9 @@ EXCLUDE_PARTS = {
     "__pycache__", "keys.yaml", ".git", ".workbuddy", "vendor",
     "logs", "session_", "usage.jsonl", "shell_audit.log",
     "denied_access.log", "review_", "chat_cursor", "agent.lock", ".pyc",
+    # ★仓库维护脚本，运行时不需要，且**自身含明文敏感词/本机路径**——绝不能进分发包
+    #   （2026-10-18 实测：这两个文件被打进 bundle，等于把脱敏词表一起发出去）
+    "sanitize_repo.py", "filter_blob_callback.py",
 }
 
 # 覆盖 embed 默认的 _pth：站内 site-packages 即用（wheel 直接解压进去，无需 pip）

@@ -18,3 +18,7 @@ Thumbs.db
 config/config.yaml
 aitest/_localpaths.py
 agent_bundle.zip
+
+### 脱敏工具（自身含明文敏感词表，永不入库）###
+scripts/sanitize_repo.py
+scripts/filter_blob_callback.py

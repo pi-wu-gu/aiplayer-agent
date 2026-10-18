@@ -19,6 +19,7 @@
 ★收窄语义：角色的 file_mode 只能比父级更严，不能更宽（见 intersect）。
 """
 import os
+import re
 import sys
 
 from core import config_loader
@@ -35,7 +36,15 @@ WINDOWS = sys.platform.startswith("win")
 
 
 def normalize_mode(value):
-    """把用户写的模式名归一为 full / readonly / off；无法识别按 full（兼容旧配置）。"""
+    """把用户写的模式名归一为 full / readonly / off。
+
+    ★2026-10-18 修：YAML 1.1 把裸 `off` / `no` / `false` 解析成**布尔 False**，
+    而 `str(False or "")` = `""` → 落回默认 `"full"`。于是
+    `file_mode: off`（机主想**关掉**文件能力）实际变成 **全开**——权限反转，方向危险。
+    现在显式处理布尔：False → off、True → full；其余无法识别仍按 full（兼容旧配置）。
+    """
+    if isinstance(value, bool):
+        return "full" if value else "off"
     return _ALIASES.get(str(value or "").strip().lower(), "full")
 
 
@@ -82,15 +91,31 @@ def _inside(root, target):
     return target_n.startswith(root_n.rstrip("\\/") + os.sep)
 
 
+def _split_root_prefix(raw, roots):
+    """解析 `root:相对路径` 写法（如 `shared:docs/记忆`）。返回 (根名, 相对路径) 或 None。
+
+    ★为什么要有（2026-10-18 实测）：file_list/file_stat 的**返回值**是 `shared:docs/记忆/...`
+    这种带根名的格式，agent 照着这个格式当**输入**再调一次时却报"不是目录"——
+    输出格式和输入语法不一致，害它连试 3 次（相对路径→shared:前缀→绝对路径）。
+    """
+    m = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*):(?![/\\])(.*)$", raw)
+    if m and m.group(1) in roots:
+        return m.group(1), m.group(2)
+    return None
+
+
 def safe_path(cfg, path):
     """把请求路径解析到某个白名单根内；越界抛 ValueError。
 
-    绝对路径必须落在某个白名单根内；相对路径一律先拼到 default_root 再判定。
+    绝对路径必须落在某个白名单根内；相对路径先按 `root:rel` 前缀解析（无前缀则拼 default_root）。
     realpath 同时完成"归一 + 解开符号链接"，因此不会出现链接逃逸。
     """
     roots = resolve_roots(cfg)
     default = default_root_name(cfg)
     raw = str(path or "")
+    pref = _split_root_prefix(raw, roots)
+    if pref is not None:
+        raw = os.path.join(roots[pref[0]], pref[1])
     candidate = os.path.realpath(raw if os.path.isabs(raw) else os.path.join(roots[default], raw))
     for root in roots.values():
         if _inside(root, candidate):
@@ -102,6 +127,31 @@ def safe_path(cfg, path):
 def describe_roots(cfg):
     roots = resolve_roots(cfg)
     return "、".join("%s=%s" % (k, v) for k, v in sorted(roots.items()))
+
+
+def safe_path_gated(cfg, path, tool, args, risk="high"):
+    """白名单判定 + 越界走授权申请（2026-10-18）。
+
+    返回 (real_path, None) 或 (None, 申请提示 dict)。
+    越界时不再"一拒了之"：若操作者已在控制台批准过这一次的 (工具+参数)，则本次放行；
+    否则登记一条待审核申请。这样"白名单外的正当需求"仍有一条受控通道。
+    """
+    from core import approval
+    try:
+        return safe_path(cfg, path), None
+    except ValueError as e:
+        if approval.check(cfg, tool, args):
+            # 已批准 → 本次放行（令牌在 check 内已被消费）
+            raw = str(path or "")
+            roots = resolve_roots(cfg)
+            base = roots.get(default_root_name(cfg), config_loader.AGENT_ROOT)
+            return os.path.realpath(raw if os.path.isabs(raw)
+                                    else os.path.join(base, raw)), None
+        if not approval.enabled(cfg):
+            return None, {"ok": False, "blocked": True, "reason": str(e)}
+        return None, approval.require(cfg, tool, args, reason=str(e)[:160],
+                                      risk=risk,
+                                      how_to="批准后可用**相同路径**重试一次（单次放行）。")
 
 
 def make_file_tools(cfg, mode_override=None):
@@ -119,7 +169,9 @@ def make_file_tools(cfg, mode_override=None):
     roots_desc = describe_roots(cfg)
 
     def _read(path, max_chars=8000):
-        real = safe_path(cfg, path)
+        real, gate = safe_path_gated(cfg, path, "file_read", {"path": path}, risk="medium")
+        if gate is not None:
+            return gate
         if os.path.isdir(real):
             # 目录 → 列条目（名称/类型/大小），供 agent 定位文件
             out = []
@@ -134,7 +186,9 @@ def make_file_tools(cfg, mode_override=None):
                 "truncated": os.path.getsize(real) > max_chars}
 
     def _write(path, content, append=False):
-        real = safe_path(cfg, path)
+        real, gate = safe_path_gated(cfg, path, "file_write", {"path": path}, risk="medium")
+        if gate is not None:
+            return gate
         os.makedirs(os.path.dirname(real) or ".", exist_ok=True)
         mode_f = "a" if append else "w"
         with open(real, mode_f, encoding="utf-8") as f:
@@ -144,9 +198,15 @@ def make_file_tools(cfg, mode_override=None):
     read_manifest = {
         "name": "file_read",
         "description": "读文件（越界拒绝；相对路径默认落在 %s）。白名单工作区：%s。"
-                       "路径是目录时返回条目列表。返回前 8000 字符。" % (default, roots_desc),
+                       "路径是目录时返回条目列表。返回前 8000 字符。"
+                       "★也支持「根名:相对路径」写法（如 shared:docs/记忆/INDEX.md）——"
+                       "和工具返回里看到的格式一致，直接照抄即可。"
+                       "★大文件用 max_chars 控制返回长度（默认 8000，超长会被标记 truncated）。"
+                       % (default, roots_desc),
         "parameters": {"type": "object", "required": ["path"],
-                       "properties": {"path": {"type": "string"}}},
+                       "properties": {"path": {"type": "string"},
+                                      "max_chars": {"type": "integer",
+                                                    "description": "最多返回字符数，默认 8000"}}},
     }
     write_manifest = {
         "name": "file_write",

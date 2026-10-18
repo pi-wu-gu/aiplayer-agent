@@ -10,7 +10,7 @@ auditor:
     llm_calls.jsonl（模型完整输出+用量）、usage.jsonl（token账本）、session_*.jsonl（会话消息流）。
     审计要点：无效/重复动作、轮次与token浪费点、红线违反（攻击玩家/超100字聊天/失步操作）、
     模型能力问题（如参数名写错）。报告≤15行，按严重度排序，给出1-3条改进建议。
-  tools: [file_read]
+  tools: [file_read, file_list, file_grep, file_stat]
   file_mode: readonly
   allowed_models: any
 
@@ -19,5 +19,5 @@ planner:
     你是任务规划 agent。根据主 agent 给出的目标与状态快照，输出分步执行清单（编号、每步一条命令级动作、
     含验证点）。不执行任何游戏动作。清单≤15步，语言精简。
   tools: []
-  file_mode: off
+  file_mode: "off"      # ★必须加引号：YAML 1.1 把裸 off 解析成布尔 False（已在 normalize_mode 兜底）
   allowed_models: any

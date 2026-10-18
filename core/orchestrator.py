@@ -11,7 +11,8 @@ from core.agent import Agent
 from core.chat_buffer import ChatBuffer
 from core.context import ResultCompressor
 from core.logger import AgentLogger
-from tools.builtin import mc_bridge, file_io, balance_query, shell_exec, wake_words, web_fetch
+from tools.builtin import (mc_bridge, file_io, file_ops, balance_query,  # noqa: E401
+                           shell_exec, wake_words, wake_blacklist, web_fetch)
 
 ROLES_PATH = os.path.join(config_loader.AGENT_ROOT, "agents", "roles.yaml")
 
@@ -33,6 +34,10 @@ def build_registry(cfg, tool_names=None, file_mode=None):
     # 文件工具整组按权限表产出：off → 空、readonly → 仅 file_read
     for m, fn in file_io.make_file_tools(cfg, mode_override=file_mode):
         built[m["name"]] = (m, fn)
+    # ★框架侧完整文件能力（2026-10-18）：list/stat/grep + mkdir/copy/move/delete/restore。
+    # 目标：框架脱离模组也能独立完成全部文件工作（模组侧 mc_act file_* 已标注弃用但保留）。
+    for m, fn in file_ops.make_file_ops_tools(cfg):
+        built[m["name"]] = (m, fn)
     for m, fn in balance_query.make_balance_tool(cfg):
         built[m["name"]] = (m, fn)
     # ★高危可选项：本机命令行（默认关闭 → 空列表；开启后仍受白名单/聊天隔离/审计约束）
@@ -40,6 +45,11 @@ def build_registry(cfg, tool_names=None, file_mode=None):
         built[m["name"]] = (m, fn)
     # 可选项：AI 自管唤醒词（默认关闭 → 空列表）
     for m, fn in wake_words.make_wake_words_tools(cfg):
+        built[m["name"]] = (m, fn)
+    # AI 自管唤醒黑名单（默认开启）：protected=不得屏蔽的词（bot 名 + 操作者触发词）
+    _protected = list((cfg.get("daemon") or {}).get("bot_names") or []) + \
+        list((cfg.get("daemon") or {}).get("mention_extra") or [])
+    for m, fn in wake_blacklist.make_wake_blacklist_tools(cfg, protected=_protected):
         built[m["name"]] = (m, fn)
     # 网页抓取（默认开启；enabled=false → 空列表。聊天隔离见 web_fetch.allow_from_chat）
     for m, fn in web_fetch.make_web_tools(cfg):

@@ -21,6 +21,10 @@ import urllib.request
 
 BASE = "http://127.0.0.1:8780"
 
+# ★本机回环地址禁用代理：环境里的 http_proxy（如 127.0.0.1:50042）会把 8780 请求劫走
+#   返 502 Bad Gateway——客户端没起来时的 502 是代理假象，不是模组故障
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 def _post(path, payload, timeout=30):
     req = urllib.request.Request(
@@ -28,12 +32,12 @@ def _post(path, payload, timeout=30):
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _opener.open(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
 def _get(path, timeout=10):
-    with urllib.request.urlopen(BASE + path, timeout=timeout) as r:
+    with _opener.open(BASE + path, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
 

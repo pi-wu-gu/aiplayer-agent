@@ -138,6 +138,23 @@ def _dig_mc_state(raw):
         keep["chat_last2"] = chat[-2:]
     if d.get("players"):
         keep["players"] = d["players"][:2]
+    # ★补"界面/输入/状态"类字段（2026-10-18）：旧白名单把它们全丢了，agent 每轮都
+    # 被迫用 mc_act state/time 重查同一件事（实例 session_20261018_031332 第 1、17 轮
+    # 都要 screen/window_active/mouse_grabbed，摘要里一个都没有 → 各多烧一轮）。
+    for k in ("screen", "window_active", "mouse_grabbed", "onGround", "sprinting",
+              "flying", "vehicle"):
+        if d.get(k) is not None:
+            keep[k] = d[k]
+    eff = d.get("effects")
+    if eff:
+        keep["effects"] = eff[:4]
+    # ★未知字段透传：让 agent 当场看到自己字段名写错了（"timeOfDay/canSleep" 在
+    # /state 里根本不存在，正确是 time.timeOfDay；time 动作才有 canSleep），
+    # 免得它把"字段被压缩了"当成环境故障再查一遍。
+    unk = d.get("_unknown_fields")
+    if unk:
+        keep["_unknown_fields"] = unk
+        keep["_hint"] = "timeOfDay→time.timeOfDay；canSleep 用 mc_act type=time；附近玩家→players"
     return json.dumps(keep, ensure_ascii=False)
 
 
