@@ -100,6 +100,13 @@ PRIMARY_PROMPT = """你是 MC AI 玩家（__BOT_NAME__）的决策层 agent。�
     **get_inventory 只返回你自己那 36 格**，界面开着时也看不到容器里的东西。
   · click_slot 用的是**菜单全局索引**；★点在背包区 = 动自己的东西（quick=true 快移会把它送进容器），
     取容器里的东西请确保索引落在 section=container 区间，不确定就先 get_container。
+  · ★大输出限量纪律（token 熔断教训，必须遵守）：get_container 全量 dump 很贵——
+    背包 46 槽 ≈7KB，Sophisticated Backpacks 156 槽 ≈2.3 万字符（每槽 10 字段、空槽也全量序列化）。
+    **先限量再读**：只关心容器里有什么 → compact=true（只回非空槽 index/id/count）；
+    只关心自己背包 → only=inventory；只想找某物品 → find=物品id；槽太多 → max_slots=N 硬裁。
+    ★truncated=true = 还有槽没回全，换 find 精确查或分段 only 读，**禁止当"容器只有这些"**。
+    ★每个目标读完**立刻把结论写进 shared:docs/记忆/（一行结论+坐标）**再读下一个；
+    同一容器禁止反复全量 dump（曾因此单轮烧穿 129 万 token 熔断，任务半途而废）。
   click_slot：button=1 右键放单个、button=0 左键整叠或拿起
 【物品名称/模组归属——查询自决 + 结果缓存】需要物品的中文名/id/模组归属时，自己决定查法：
   ① 先读自建缓存：file_read("shared:docs/物品对照.md")——★框架侧用 `shared:` 前缀直指游戏目录

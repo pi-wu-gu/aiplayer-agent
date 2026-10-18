@@ -226,6 +226,57 @@ def _dig_get_screen(raw):
     return json.dumps(out, ensure_ascii=False)
 
 
+def _dig_container(raw):
+    """get_container → 紧凑摘要（对齐模组侧 compact 语义）。
+
+    ★令牌炸弹治理（2026-10-18 实测）：Sophisticated Backpacks 156 槽全量 dump
+    ≈2.3 万字符（每槽 10 字段、空槽也全量序列化）原样进上下文，几条就把会话顶爆。
+    只留**非空槽**（index/sec/id/count）、ranges、光标/悬停；truncated 时明确标注
+    "还有槽没列"，引导用 find/only 精确查——禁止把截断结果当"容器只有这些"。"""
+    d = _unwrap(raw)
+    slots = d.get("slots")
+    if slots is None and d.get("matches") is None and d.get("ranges") is None:
+        raise ValueError("非容器结构，回退通用摘要")
+    out = {"action": "get_container", "title": d.get("title"),
+           "menu": d.get("menu"), "slot_count": d.get("slot_count")}
+    if d.get("find"):
+        out["find"] = d["find"]
+        ms = d.get("matches") or []
+        out["matched"] = d.get("matched", len(ms))
+        out["matches"] = [
+            {"槽": m.get("index"), "sec": m.get("sec"),
+             "id": str(m.get("id", "?")).replace("minecraft:", ""), "n": m.get("count")}
+            for m in ms[:60]]
+        out["hint"] = d.get("hint") or "点匹配槽用 click_slot{slot=index}"
+    else:
+        non_empty = [s for s in (slots or []) if s.get("id") and s.get("id") != "air"]
+        out["槽位统计"] = {"总槽": d.get("slot_count"), "列出": len(slots or []),
+                          "非空": len(non_empty)}
+        if d.get("truncated"):
+            out["truncated"] = True
+            out["_note"] = ("★有槽被上限裁掉未列出——换 find=物品id 精确查或 "
+                            "only=container|inventory 分段读，禁止当'容器只有这些'")
+        if non_empty:
+            out["非空槽"] = [
+                {"槽": s.get("index"), "sec": s.get("sec"),
+                 "id": str(s.get("id", "?")).replace("minecraft:", ""), "n": s.get("count")}
+                for s in non_empty[:80]]
+            if len(non_empty) > 80:
+                out["非空槽_note"] = "共%d个非空槽，只列前80" % len(non_empty)
+        rs = d.get("ranges") or []
+        if rs:
+            out["ranges"] = [{"sec": r.get("sec"), "from": r.get("from"),
+                              "to": r.get("to")} for r in rs]
+        cur = d.get("cursor")
+        if isinstance(cur, dict) and cur.get("id") and cur.get("id") != "air":
+            out["光标持有"] = "%s x%s" % (cur.get("id"), cur.get("count"))
+        if d.get("hovered") is not None:
+            out["悬停槽"] = d.get("hovered")
+        out["hint"] = ("点槽位用 click_slot{slot=index}；★以后读容器先限量："
+                       "compact=true / only=container|inventory / max_slots=N / find=物品id")
+    return json.dumps(out, ensure_ascii=False)
+
+
 def _dig_scan_region(raw):
     """scan_region → 聚合摘要。
 
@@ -271,8 +322,8 @@ DIGESTERS = {
     "mc_state": _dig_mc_state,
     "mc_chat": _dig_mc_chat,
     "get_inventory": _dig_inventory,
-    "cont_info": _dig_inventory,
-    "get_container": _dig_inventory,
+    "cont_info": _dig_container,
+    "get_container": _dig_container,
     "get_screen": _dig_get_screen,
     "screen": _dig_get_screen,
     "scan_region": _dig_scan_region,
